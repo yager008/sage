@@ -40,7 +40,7 @@ This document is maintained by the Codex agent to explain every code change, rat
 - Added a "Docs" toggle in the overlay so the sliding panel can swap between editable notes and a read-only engine guide, with selectable text and a copy-to-clipboard shortcut.
 - Enabled smooth WASD panning, mouse-wheel zoom, and grid cube placement/removal via mouse clicks; camera now uses gluLookAt for a tilted orbit.
 - Added a bottom "Content" panel that slides up like Unreal's browser and lets you choose between blue/red/grey cube presets when spawning.
-- Painted the 3D view with a subtle blue-to-pink gradient background instead of a flat clear colour.
+- Painted the 3D view with an adjustable blue/pink gradient and exposed an Environment panel with live color pickers.
 - Added a `webgl/` target that rewrites the engine around SDL2/OpenGL ES 3 + ImGui backends so it can be compiled with Emscripten and embedded in a browser. Includes shader-based rendering, the same code/docs/content overlays, Lua syntax highlighting, and cube placement logic ported to modern GL.
 - Renamed the overlay/panel to "Code" and layered a lightweight Lua syntax highlighter over the editor to make scripts easier to read.
 - Rationale: fulfill request for an ImGui-based code window while maintaining the retro render pipeline and platform independence of the rest of the app.
