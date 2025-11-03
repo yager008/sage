@@ -25,8 +25,8 @@ This document is maintained by the Codex agent to explain every code change, rat
 
 ### Change Set – Code Panel Simplification
 
-- Removed experimental Vim-mode controls and checkbox, returning the notes editor to default Win32 behaviour for predictability (`src/main.cpp` input handling and window setup).
-- Retained the dedicated notes panel but refreshed its fill routine so the background renders solid white behind text, avoiding the default blue tint on themed systems.
+- Removed experimental Vim-mode controls and checkbox, returning the code editor to default Win32 behaviour for predictability (`src/main.cpp` input handling and window setup).
+- Retained the dedicated code panel but refreshed its fill routine so the background renders solid white behind text, avoiding the default blue tint on themed systems.
 - Cleaned up auxiliary Vim-specific utilities and subclassing hooks to keep the codebase minimal.
 - Rationale: user requested the classic text box feel without advanced keybindings while preserving readability improvements.
 
@@ -35,12 +35,12 @@ This document is maintained by the Codex agent to explain every code change, rat
 - Replaced the Win32 edit control with an integrated Dear ImGui context rendered on top of the OpenGL scene, creating a dedicated "Code" window with multiline editing (`src/main.cpp`, ImGui setup/rendering path).
 - Wired the new UI into the existing text persistence pipeline, keeping auto-load/save of `notes.txt` and adding an explicit in-window "Save" action.
 - Updated the build to compile ImGui core and Win32/OpenGL backends, adding necessary include paths and libraries in `Makefile`.
-- Polished the notes UI into a fixed-size, slide-in panel with a toggle button and animated hide/show so users can reclaim screen space without losing scroll state.
-- Ensured the slide-in notes panel resizes with the window while sticking with ImGui's default font to keep the setup portable.
-- Added a "Docs" toggle in the overlay so the sliding panel can swap between editable notes and a read-only engine guide, with selectable text and a copy-to-clipboard shortcut.
+- Polished the code UI into a fixed-size, slide-in panel with a toggle button and animated hide/show so users can reclaim screen space without losing scroll state.
+- Ensured the slide-in code panel resizes with the window while sticking with ImGui's default font to keep the setup portable.
+- Added a "Docs" toggle in the overlay so the sliding panel can swap between editable code and a read-only engine guide, with selectable text and a copy-to-clipboard shortcut.
 - Enabled smooth WASD panning, mouse-wheel zoom, and grid cube placement/removal via mouse clicks; camera now uses gluLookAt for a tilted orbit.
 - Added a bottom "Content" panel that slides up like Unreal's browser and lets you choose between blue/red/grey cube presets when spawning.
 - Painted the 3D view with an adjustable blue/pink gradient and exposed an Environment panel with live color pickers.
+- Reworked world interaction so blocks have full 3D coordinates: left click adds to any face (including new floor blocks below the grid), right click removes the top-most block in a column, and the player now walks, jumps, and collides smoothly against the tower of blocks.
+- Camera rotation can now be smoothly tweened in 90° increments via the `Q`/`E` keys while orbiting around the world origin; character movement re-aligns with the camera heading.
 - Added a `webgl/` target that rewrites the engine around SDL2/OpenGL ES 3 + ImGui backends so it can be compiled with Emscripten and embedded in a browser. Includes shader-based rendering, the same code/docs/content overlays, Lua syntax highlighting, and cube placement logic ported to modern GL.
-- Renamed the overlay/panel to "Code" and layered a lightweight Lua syntax highlighter over the editor to make scripts easier to read.
-- Rationale: fulfill request for an ImGui-based code window while maintaining the retro render pipeline and platform independence of the rest of the app.

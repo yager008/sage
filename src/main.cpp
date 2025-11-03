@@ -4,6 +4,7 @@
 #include <GL/glu.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 #include <random>
 #include <fstream>
@@ -31,6 +32,7 @@ namespace
     struct PlacedCube
     {
         int gridX;
+        int gridY;
         int gridZ;
         float r;
         float g;
@@ -45,13 +47,8 @@ namespace
         float rotation = 0.0f;
         float cubeX = 0.0f;
         float cubeZ = 0.0f;
-        float moveStartX = 0.0f;
-        float moveStartZ = 0.0f;
-        float moveTargetX = 0.0f;
-        float moveTargetZ = 0.0f;
-        float moveTimer = 0.0f;
-        float moveDuration = 0.2f;
-        bool moving = false;
+        float velX = 0.0f;
+        float velZ = 0.0f;
     };
 
     bool g_running = true;
@@ -81,6 +78,28 @@ namespace
         float b;
     };
 
+    struct Vec3
+    {
+        float x;
+        float y;
+        float z;
+
+        Vec3 operator+(const Vec3& rhs) const
+        {
+            return Vec3{x + rhs.x, y + rhs.y, z + rhs.z};
+        }
+
+        Vec3 operator-(const Vec3& rhs) const
+        {
+            return Vec3{x - rhs.x, y - rhs.y, z - rhs.z};
+        }
+
+        Vec3 operator*(float scalar) const
+        {
+            return Vec3{x * scalar, y * scalar, z * scalar};
+        }
+    };
+
     std::string g_notesFilePath;
     std::string g_notesContent;
     bool g_notesDirty = false;
@@ -101,10 +120,12 @@ namespace
         "Environment Panel:\n"
         "  Adjust sky gradient colors in real time\n";
 
-    bool g_cameraMoveForward = false;
-    bool g_cameraMoveBackward = false;
-    bool g_cameraMoveLeft = false;
-    bool g_cameraMoveRight = false;
+    float g_cameraYawDegrees = 0.0f;
+    float g_cameraYawTarget = 0.0f;
+    bool g_moveForward = false;
+    bool g_moveBackward = false;
+    bool g_moveLeft = false;
+    bool g_moveRight = false;
     float g_cameraFocusX = 0.0f;
     float g_cameraFocusZ = 0.0f;
     float g_cameraDistance = 8.0f;
@@ -113,6 +134,7 @@ namespace
     constexpr float kCameraMoveSpeed = 6.0f;
     constexpr float kCameraZoomStep = 0.6f;
     constexpr float kCameraPitchDegrees = 65.0f;
+    constexpr float kCameraRotationSpeed = 240.0f;
     std::vector<PlacedCube> g_placedCubes;
     bool g_showContentPanel = false;
     bool g_showEnvironmentPanel = false;
@@ -121,6 +143,33 @@ namespace
     constexpr float kContentPanelSlideSpeed = 12.0f;
     ColorRGB g_gradientTop{0.18f, 0.13f, 0.25f};
     ColorRGB g_gradientBottom{0.03f, 0.05f, 0.12f};
+    constexpr float kPlayerRadius = 0.35f;
+    constexpr float kPlayerHeight = 1.0f;
+    constexpr float kStepHeight = 1.0f;
+
+    Vec3 CameraForward2D()
+    {
+        const float yawRadians = g_cameraYawDegrees * (kPi / 180.0f);
+        return Vec3{std::sin(yawRadians), 0.0f, std::cos(yawRadians)};
+    }
+
+    Vec3 CameraRight2D()
+    {
+        Vec3 forward = CameraForward2D();
+        return Vec3{forward.z, 0.0f, -forward.x};
+    }
+
+    void NormalizeAngle(float& angle)
+    {
+        while (angle >= 360.0f)
+        {
+            angle -= 360.0f;
+        }
+        while (angle < 0.0f)
+        {
+            angle += 360.0f;
+        }
+    }
 
     struct SpawnPreset
     {
@@ -141,6 +190,183 @@ namespace
     {
         const int clamped = std::clamp(g_selectedPresetIndex, 0, static_cast<int>(std::size(kSpawnPresets)) - 1);
         return kSpawnPresets[clamped];
+    }
+
+    int FindCubeIndex(int x, int y, int z)
+    {
+        for (size_t i = 0; i < g_placedCubes.size(); ++i)
+        {
+            const PlacedCube& cube = g_placedCubes[i];
+            if (cube.gridX == x && cube.gridY == y && cube.gridZ == z)
+            {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    int FindHighestCubeIndex(int x, int z)
+    {
+        int bestIndex = -1;
+        int bestHeight = std::numeric_limits<int>::min();
+        for (size_t i = 0; i < g_placedCubes.size(); ++i)
+        {
+            const PlacedCube& cube = g_placedCubes[i];
+            if (cube.gridX == x && cube.gridZ == z && cube.gridY > bestHeight)
+            {
+                bestHeight = cube.gridY;
+                bestIndex = static_cast<int>(i);
+            }
+        }
+        return bestIndex;
+    }
+
+    void PlaceCube(int x, int y, int z, const SpawnPreset& preset)
+    {
+        if (std::abs(x) > 100 || std::abs(z) > 100)
+        {
+            return;
+        }
+        if (FindCubeIndex(x, y, z) >= 0)
+        {
+            return;
+        }
+        g_placedCubes.push_back({x, y, z, preset.r, preset.g, preset.b});
+    }
+
+    void RemoveCube(int x, int y, int z)
+    {
+        int index = FindCubeIndex(x, y, z);
+        if (index >= 0)
+        {
+            g_placedCubes.erase(g_placedCubes.begin() + index);
+        }
+    }
+
+    struct RayHit
+    {
+        bool hit = false;
+        bool hitCube = false;
+        bool hitGround = false;
+        float t = std::numeric_limits<float>::max();
+        int cubeX = 0;
+        int cubeY = 0;
+        int cubeZ = 0;
+        int groundX = 0;
+        int groundZ = 0;
+        Vec3 normal{0.0f, 1.0f, 0.0f};
+    };
+
+    bool RayIntersectsAABB(const Vec3& origin, const Vec3& dir, const Vec3& minB, const Vec3& maxB, float& tOut, Vec3& normalOut)
+    {
+        float tMin = 0.0f;
+        float tMax = std::numeric_limits<float>::max();
+        Vec3 normal{0.0f, 0.0f, 0.0f};
+        int hitAxis = -1;
+        float hitSign = 0.0f;
+
+        auto checkAxis = [&](float originComponent, float dirComponent, float minVal, float maxVal, int axis) -> bool {
+            if (std::fabs(dirComponent) < 1e-6f)
+            {
+                if (originComponent < minVal || originComponent > maxVal)
+                {
+                    return false;
+                }
+                return true;
+            }
+
+            float invD = 1.0f / dirComponent;
+            float t1 = (minVal - originComponent) * invD;
+            float t2 = (maxVal - originComponent) * invD;
+            float sign = -1.0f;
+            if (t1 > t2)
+            {
+                std::swap(t1, t2);
+                sign = 1.0f;
+            }
+            if (t1 > tMin)
+            {
+                tMin = t1;
+                hitAxis = axis;
+                hitSign = sign;
+            }
+            tMax = std::min(tMax, t2);
+            if (tMax < tMin)
+            {
+                return false;
+            }
+            return true;
+        };
+
+        if (!checkAxis(origin.x, dir.x, minB.x, maxB.x, 0) ||
+            !checkAxis(origin.y, dir.y, minB.y, maxB.y, 1) ||
+            !checkAxis(origin.z, dir.z, minB.z, maxB.z, 2))
+        {
+            return false;
+        }
+
+        if (hitAxis == 0)
+        {
+            normal = Vec3{hitSign, 0.0f, 0.0f};
+        }
+        else if (hitAxis == 1)
+        {
+            normal = Vec3{0.0f, hitSign, 0.0f};
+        }
+        else if (hitAxis == 2)
+        {
+            normal = Vec3{0.0f, 0.0f, hitSign};
+        }
+
+        tOut = tMin;
+        normalOut = normal;
+        return true;
+    }
+
+    RayHit CastWorldRay(const Vec3& origin, const Vec3& dir)
+    {
+        RayHit result;
+        if (std::fabs(dir.y) > 1e-6f)
+        {
+            float t = -origin.y / dir.y;
+            if (t > 0.0f)
+            {
+                Vec3 hitPoint = origin + dir * t;
+                int gx = static_cast<int>(std::round(hitPoint.x));
+                int gz = static_cast<int>(std::round(hitPoint.z));
+                if (std::fabs(hitPoint.x) <= 200.0f && std::fabs(hitPoint.z) <= 200.0f)
+                {
+                    result.hit = true;
+                    result.hitGround = true;
+                    result.hitCube = false;
+                    result.t = t;
+                    result.groundX = gx;
+                    result.groundZ = gz;
+                    result.normal = Vec3{0.0f, 1.0f, 0.0f};
+                }
+            }
+        }
+
+        for (const PlacedCube& cube : g_placedCubes)
+        {
+            Vec3 minB{static_cast<float>(cube.gridX) - 0.5f, static_cast<float>(cube.gridY), static_cast<float>(cube.gridZ) - 0.5f};
+            Vec3 maxB{static_cast<float>(cube.gridX) + 0.5f, static_cast<float>(cube.gridY) + 1.0f, static_cast<float>(cube.gridZ) + 0.5f};
+            float t = 0.0f;
+            Vec3 normal;
+            if (RayIntersectsAABB(origin, dir, minB, maxB, t, normal) && t > 0.0f && t < result.t)
+            {
+                result.hit = true;
+                result.hitCube = true;
+                result.hitGround = false;
+                result.t = t;
+                result.cubeX = cube.gridX;
+                result.cubeY = cube.gridY;
+                result.cubeZ = cube.gridZ;
+                result.normal = normal;
+            }
+        }
+
+        return result;
     }
 
     const std::unordered_set<std::string> kLuaKeywords = {
@@ -295,11 +521,6 @@ namespace
     int g_snowBufferHeight = 0;
     std::mt19937 g_rng{1337u};
 
-    float Lerp(float a, float b, float t)
-    {
-        return a + (b - a) * t;
-    }
-
     float RandomRange(float minVal, float maxVal)
     {
         std::uniform_real_distribution<float> dist(minVal, maxVal);
@@ -429,43 +650,6 @@ namespace
                 pixelBuffer[index + 1] = 255;
                 pixelBuffer[index + 2] = 255;
             }
-        }
-    }
-
-    void RequestMove(int dx, int dz)
-    {
-        if ((dx == 0 && dz == 0) || g_game.moving)
-        {
-            return;
-        }
-
-        g_game.moving = true;
-        g_game.moveTimer = 0.0f;
-        g_game.moveStartX = g_game.cubeX;
-        g_game.moveStartZ = g_game.cubeZ;
-        g_game.moveTargetX = g_game.cubeX + static_cast<float>(dx) * kGridCellSize;
-        g_game.moveTargetZ = g_game.cubeZ + static_cast<float>(dz) * kGridCellSize;
-    }
-
-    void UpdateGridMovement(float deltaTime)
-    {
-        if (!g_game.moving)
-        {
-            return;
-        }
-
-        g_game.moveTimer += deltaTime;
-        const float duration = std::max(0.0001f, g_game.moveDuration);
-        const float progress = std::clamp(g_game.moveTimer / duration, 0.0f, 1.0f);
-        g_game.cubeX = Lerp(g_game.moveStartX, g_game.moveTargetX, progress);
-        g_game.cubeZ = Lerp(g_game.moveStartZ, g_game.moveTargetZ, progress);
-
-        if (g_game.moveTimer >= duration)
-        {
-            g_game.cubeX = g_game.moveTargetX;
-            g_game.cubeZ = g_game.moveTargetZ;
-            g_game.moving = false;
-            g_game.moveTimer = duration;
         }
     }
 
@@ -635,10 +819,210 @@ namespace
         for (const PlacedCube& cube : g_placedCubes)
         {
             glPushMatrix();
-            glTranslatef(static_cast<float>(cube.gridX), 0.5f, static_cast<float>(cube.gridZ));
+            glTranslatef(static_cast<float>(cube.gridX), static_cast<float>(cube.gridY) + 0.5f, static_cast<float>(cube.gridZ));
             RenderMesh(mesh, cube.r, cube.g, cube.b);
             glPopMatrix();
         }
+    }
+
+    bool OverlapsRange(float minA, float maxA, float minB, float maxB)
+    {
+        return maxA > minB && minA < maxB;
+    }
+
+    bool CollidesAtPosition(const Vec3& pos)
+    {
+        const float minX = pos.x - kPlayerRadius;
+        const float maxX = pos.x + kPlayerRadius;
+        const float minY = pos.y;
+        const float maxY = pos.y + kPlayerHeight;
+        const float minZ = pos.z - kPlayerRadius;
+        const float maxZ = pos.z + kPlayerRadius;
+
+        for (const PlacedCube& cube : g_placedCubes)
+        {
+            const float cubeMinX = static_cast<float>(cube.gridX) - 0.5f;
+            const float cubeMaxX = static_cast<float>(cube.gridX) + 0.5f;
+            const float cubeMinY = static_cast<float>(cube.gridY);
+            const float cubeMaxY = static_cast<float>(cube.gridY) + 1.0f;
+            const float cubeMinZ = static_cast<float>(cube.gridZ) - 0.5f;
+            const float cubeMaxZ = static_cast<float>(cube.gridZ) + 0.5f;
+
+            if (OverlapsRange(minX, maxX, cubeMinX, cubeMaxX) &&
+                OverlapsRange(minY, maxY, cubeMinY, cubeMaxY) &&
+                OverlapsRange(minZ, maxZ, cubeMinZ, cubeMaxZ))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    float HighestSurfaceAt(const Vec3& pos)
+    {
+        float height = 0.0f;
+        const float minX = pos.x - kPlayerRadius;
+        const float maxX = pos.x + kPlayerRadius;
+        const float minZ = pos.z - kPlayerRadius;
+        const float maxZ = pos.z + kPlayerRadius;
+
+        for (const PlacedCube& cube : g_placedCubes)
+        {
+            const float cubeMinX = static_cast<float>(cube.gridX) - 0.5f;
+            const float cubeMaxX = static_cast<float>(cube.gridX) + 0.5f;
+            const float cubeMinZ = static_cast<float>(cube.gridZ) - 0.5f;
+            const float cubeMaxZ = static_cast<float>(cube.gridZ) + 0.5f;
+            if (OverlapsRange(minX, maxX, cubeMinX, cubeMaxX) &&
+                OverlapsRange(minZ, maxZ, cubeMinZ, cubeMaxZ))
+            {
+                height = std::max(height, static_cast<float>(cube.gridY) + 1.0f);
+            }
+        }
+
+        return height;
+    }
+
+    void UpdatePlayerMovement(float deltaTime)
+    {
+        Vec3 position{g_game.cubeX, g_game.cubeY, g_game.cubeZ};
+
+        Vec3 moveInput{0.0f, 0.0f, 0.0f};
+        if (g_moveForward)
+        {
+            Vec3 forward = CameraForward2D();
+            moveInput.x += forward.x;
+            moveInput.z += forward.z;
+        }
+        if (g_moveBackward)
+        {
+            Vec3 forward = CameraForward2D();
+            moveInput.x -= forward.x;
+            moveInput.z -= forward.z;
+        }
+        if (g_moveLeft)
+        {
+            Vec3 right = CameraRight2D();
+            moveInput.x -= right.x;
+            moveInput.z -= right.z;
+        }
+        if (g_moveRight)
+        {
+            Vec3 right = CameraRight2D();
+            moveInput.x += right.x;
+            moveInput.z += right.z;
+        }
+
+        const float length = std::sqrt(moveInput.x * moveInput.x + moveInput.z * moveInput.z);
+        if (length > 0.0f)
+        {
+            moveInput.x /= length;
+            moveInput.z /= length;
+        }
+
+        constexpr float kMoveSpeed = 4.0f;
+        g_game.velX = moveInput.x * kMoveSpeed;
+        g_game.velZ = moveInput.z * kMoveSpeed;
+
+        if (std::fabs(g_game.velX) > 0.001f || std::fabs(g_game.velZ) > 0.001f)
+        {
+            g_game.rotation = std::fmod((std::atan2(g_game.velX, g_game.velZ) * 180.0f / kPi) + 360.0f, 360.0f);
+        }
+
+        auto tryStep = [&](Vec3& attempt) -> bool {
+            const float currentHeight = HighestSurfaceAt(position);
+            const float targetHeight = HighestSurfaceAt(attempt);
+            if (targetHeight > currentHeight + 0.01f && targetHeight - currentHeight <= kStepHeight + 0.01f)
+            {
+                Vec3 stepped = attempt;
+                stepped.y = targetHeight;
+                if (!CollidesAtPosition(stepped))
+                {
+                    position = stepped;
+                    g_game.cubeVelocity = 0.0f;
+                    g_game.grounded = true;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto moveHorizontal = [&](float deltaX, float deltaZ) {
+            if (deltaX == 0.0f && deltaZ == 0.0f)
+            {
+                return;
+            }
+
+            Vec3 attempt = position;
+            attempt.x += deltaX;
+            attempt.z += deltaZ;
+
+            if (CollidesAtPosition(attempt))
+            {
+                if (g_game.grounded && tryStep(attempt))
+                {
+                    return;
+                }
+                if (deltaX != 0.0f)
+                {
+                    g_game.velX = 0.0f;
+                }
+                if (deltaZ != 0.0f)
+                {
+                    g_game.velZ = 0.0f;
+                }
+            }
+            else
+            {
+                position = attempt;
+            }
+        };
+
+        moveHorizontal(g_game.velX * deltaTime, 0.0f);
+        moveHorizontal(0.0f, g_game.velZ * deltaTime);
+
+        const float gravity = -9.8f;
+        g_game.cubeVelocity += gravity * deltaTime;
+        if (g_jumpRequested && g_game.grounded)
+        {
+            g_game.cubeVelocity = 5.2f;
+            g_game.grounded = false;
+        }
+        g_jumpRequested = false;
+
+        Vec3 verticalAttempt = position;
+        verticalAttempt.y += g_game.cubeVelocity * deltaTime;
+        if (verticalAttempt.y < 0.0f)
+        {
+            verticalAttempt.y = 0.0f;
+            g_game.cubeVelocity = 0.0f;
+            g_game.grounded = true;
+        }
+
+        if (CollidesAtPosition(verticalAttempt))
+        {
+            if (g_game.cubeVelocity < 0.0f)
+            {
+                verticalAttempt.y = HighestSurfaceAt(position);
+                g_game.grounded = true;
+            }
+            else
+            {
+                g_game.cubeVelocity = 0.0f;
+                verticalAttempt.y = position.y;
+            }
+            g_game.cubeVelocity = 0.0f;
+        }
+        else
+        {
+            g_game.grounded = verticalAttempt.y <= HighestSurfaceAt(verticalAttempt) + 0.01f;
+        }
+
+        position = verticalAttempt;
+
+        g_game.cubeX = position.x;
+        g_game.cubeY = position.y;
+        g_game.cubeZ = position.z;
     }
 
     void RenderGradientBackground()
@@ -678,9 +1062,12 @@ namespace
         const float pitchRadians = kCameraPitchDegrees * (kPi / 180.0f);
         const float cameraHeight = std::sin(pitchRadians) * g_cameraDistance;
         const float cameraForward = std::cos(pitchRadians) * g_cameraDistance;
-        const float eyeX = g_cameraFocusX;
+        const float yawRadians = g_cameraYawDegrees * (kPi / 180.0f);
+        const float dirX = std::sin(yawRadians);
+        const float dirZ = std::cos(yawRadians);
+        const float eyeX = g_cameraFocusX + dirX * cameraForward;
         const float eyeY = cameraHeight;
-        const float eyeZ = g_cameraFocusZ + cameraForward;
+        const float eyeZ = g_cameraFocusZ + dirZ * cameraForward;
         gluLookAt(eyeX, eyeY, eyeZ,
                   g_cameraFocusX, 0.0f, g_cameraFocusZ,
                   0.0f, 1.0f, 0.0f);
@@ -806,34 +1193,30 @@ namespace
         case WM_KEYDOWN:
             if ((lParam & (1 << 30)) == 0)
             {
-                switch (wParam)
-                {
-                case VK_SPACE:
-                    g_jumpRequested = true;
-                    return 0;
+            switch (wParam)
+            {
+            case VK_SPACE:
+                g_jumpRequested = true;
+                return 0;
                 case VK_UP:
-                    RequestMove(0, -1);
+                    g_moveForward = true;
                     return 0;
                 case VK_DOWN:
-                    RequestMove(0, 1);
+                    g_moveBackward = true;
                     return 0;
                 case VK_LEFT:
-                    RequestMove(-1, 0);
+                    g_moveLeft = true;
                     return 0;
                 case VK_RIGHT:
-                    RequestMove(1, 0);
+                    g_moveRight = true;
                     return 0;
-                case 'W':
-                    g_cameraMoveForward = true;
+                case 'Q':
+                    g_cameraYawTarget -= 90.0f;
+                    NormalizeAngle(g_cameraYawTarget);
                     return 0;
-                case 'S':
-                    g_cameraMoveBackward = true;
-                    return 0;
-                case 'A':
-                    g_cameraMoveLeft = true;
-                    return 0;
-                case 'D':
-                    g_cameraMoveRight = true;
+                case 'E':
+                    g_cameraYawTarget += 90.0f;
+                    NormalizeAngle(g_cameraYawTarget);
                     return 0;
                 default:
                     break;
@@ -843,17 +1226,17 @@ namespace
         case WM_KEYUP:
             switch (wParam)
             {
-            case 'W':
-                g_cameraMoveForward = false;
+            case VK_UP:
+                g_moveForward = false;
                 return 0;
-            case 'S':
-                g_cameraMoveBackward = false;
+            case VK_DOWN:
+                g_moveBackward = false;
                 return 0;
-            case 'A':
-                g_cameraMoveLeft = false;
+            case VK_LEFT:
+                g_moveLeft = false;
                 return 0;
-            case 'D':
-                g_cameraMoveRight = false;
+            case VK_RIGHT:
+                g_moveRight = false;
                 return 0;
             default:
                 break;
@@ -898,52 +1281,63 @@ namespace
                 break;
             }
 
-            const double dirX = farX - nearX;
-            const double dirY = farY - nearY;
-            const double dirZ = farZ - nearZ;
-            if (std::fabs(dirY) < 1e-5)
+            Vec3 origin{static_cast<float>(nearX), static_cast<float>(nearY), static_cast<float>(nearZ)};
+            Vec3 direction{static_cast<float>(farX - nearX), static_cast<float>(farY - nearY), static_cast<float>(farZ - nearZ)};
+
+            RayHit hit = CastWorldRay(origin, direction);
+            if (!hit.hit)
             {
                 break;
             }
-            const double t = -nearY / dirY;
-            if (t < 0.0)
-            {
-                break;
-            }
-
-            const double hitX = nearX + dirX * t;
-            const double hitZ = nearZ + dirZ * t;
-            const int gridX = static_cast<int>(std::round(hitX / kGridCellSize));
-            const int gridZ = static_cast<int>(std::round(hitZ / kGridCellSize));
-
-            if (std::abs(gridX) > kGridHalfSize || std::abs(gridZ) > kGridHalfSize)
-            {
-                break;
-            }
-
-            auto it = std::find_if(g_placedCubes.begin(), g_placedCubes.end(), [gridX, gridZ](const PlacedCube& cube) {
-                return cube.gridX == gridX && cube.gridZ == gridZ;
-            });
 
             if (uMsg == WM_LBUTTONDOWN)
             {
                 const SpawnPreset preset = GetSelectedPreset();
-                if (it == g_placedCubes.end())
+                if (hit.hitCube)
                 {
-                    g_placedCubes.push_back({gridX, gridZ, preset.r, preset.g, preset.b});
+                    int offsetX = static_cast<int>(std::round(hit.normal.x));
+                    int offsetY = static_cast<int>(std::round(hit.normal.y));
+                    int offsetZ = static_cast<int>(std::round(hit.normal.z));
+                    const int targetX = hit.cubeX + offsetX;
+                    const int targetY = hit.cubeY + offsetY;
+                    const int targetZ = hit.cubeZ + offsetZ;
+                    PlaceCube(targetX, targetY, targetZ, preset);
                 }
-                else
+                else if (hit.hitGround)
                 {
-                    it->r = preset.r;
-                    it->g = preset.g;
-                    it->b = preset.b;
+                    int targetX = hit.groundX;
+                    int targetZ = hit.groundZ;
+                    int targetY = -1;
+                    int topIndex = FindHighestCubeIndex(targetX, targetZ);
+                    if (topIndex >= 0)
+                    {
+                        targetY = g_placedCubes[topIndex].gridY + 1;
+                    }
+                    PlaceCube(targetX, targetY, targetZ, preset);
+                }
+
+                if (CollidesAtPosition(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ}))
+                {
+                    float top = HighestSurfaceAt(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ});
+                    g_game.cubeY = top;
+                    g_game.cubeVelocity = 0.0f;
+                    g_game.grounded = true;
                 }
             }
             else if (uMsg == WM_RBUTTONDOWN)
             {
-                if (it != g_placedCubes.end())
+                if (hit.hitCube)
                 {
-                    g_placedCubes.erase(it);
+                    RemoveCube(hit.cubeX, hit.cubeY, hit.cubeZ);
+                }
+                else if (hit.hitGround)
+                {
+                    int topIndex = FindHighestCubeIndex(hit.groundX, hit.groundZ);
+                    if (topIndex >= 0)
+                    {
+                        const PlacedCube& cube = g_placedCubes[topIndex];
+                        RemoveCube(cube.gridX, cube.gridY, cube.gridZ);
+                    }
                 }
             }
             return 0;
@@ -1325,63 +1719,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::End();
         }
 
-        if (!ImGui::GetIO().WantCaptureKeyboard)
-        {
-            float moveX = 0.0f;
-            float moveZ = 0.0f;
-            if (g_cameraMoveForward)
-            {
-                moveZ -= 1.0f;
-            }
-            if (g_cameraMoveBackward)
-            {
-                moveZ += 1.0f;
-            }
-            if (g_cameraMoveLeft)
-            {
-                moveX -= 1.0f;
-            }
-            if (g_cameraMoveRight)
-            {
-                moveX += 1.0f;
-            }
+        UpdatePlayerMovement(deltaTime);
 
-            const float lengthSq = moveX * moveX + moveZ * moveZ;
-            if (lengthSq > 0.0001f)
-            {
-                const float invLen = 1.0f / std::sqrt(lengthSq);
-                moveX *= invLen;
-                moveZ *= invLen;
-                g_cameraFocusX += moveX * kCameraMoveSpeed * deltaTime;
-                g_cameraFocusZ += moveZ * kCameraMoveSpeed * deltaTime;
-            }
-        }
-
-        if (g_jumpRequested && g_game.grounded)
-        {
-            g_game.cubeVelocity = 4.5f;
-            g_game.grounded = false;
-        }
-        g_jumpRequested = false;
-
-        UpdateGridMovement(deltaTime);
-
-        const float gravity = -9.8f;
-        g_game.cubeVelocity += gravity * deltaTime;
-        g_game.cubeY += g_game.cubeVelocity * deltaTime;
-
-        if (g_game.cubeY <= 0.0f)
-        {
-            g_game.cubeY = 0.0f;
-            g_game.cubeVelocity = 0.0f;
-            g_game.grounded = true;
-        }
-
-        g_game.rotation += 45.0f * deltaTime;
-        if (g_game.rotation > 360.0f)
-        {
-            g_game.rotation -= 360.0f;
-        }
         const int scaleX = std::max(1, g_windowWidth / kTargetPixelWidth);
         const int scaleY = std::max(1, g_windowHeight / kTargetPixelHeight);
         const int scale = std::max(1, std::min(scaleX, scaleY));
@@ -1395,6 +1734,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         UpdateProjection(renderWidth, renderHeight);
 
         RenderGradientBackground();
+        const float yawDifference = g_cameraYawTarget - g_cameraYawDegrees;
+        const float maxDelta = kCameraRotationSpeed * deltaTime;
+        const float clampedDelta = std::clamp(yawDifference, -maxDelta, maxDelta);
+        g_cameraYawDegrees += clampedDelta;
         RenderScene(g_cubeMesh);
 
         UpdateSnow(deltaTime, renderWidth, renderHeight);
