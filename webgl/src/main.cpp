@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -198,6 +199,7 @@ namespace
         float r;
         float g;
         float b;
+        bool glowing = false;
     };
 
     struct SpawnPreset
@@ -206,7 +208,16 @@ namespace
         float r;
         float g;
         float b;
+        bool glowing;
     };
+
+    constexpr SpawnPreset kSpawnPresets[] = {
+        {"Blue Cube", 0.30f, 0.45f, 0.85f, false},
+        {"Red Cube", 0.85f, 0.35f, 0.35f, false},
+        {"Grey Cube", 0.65f, 0.65f, 0.65f, false},
+        {"Glow Cube", 1.0f, 0.92f, 0.50f, true},
+    };
+    constexpr int kMaxRaytraceCubes = 64;
 
     struct AppState
     {
@@ -226,6 +237,10 @@ namespace
         bool cameraBackward = false;
         bool cameraLeft = false;
         bool cameraRight = false;
+        Vec3 cameraEye{0.0f, 6.0f, 8.0f};
+        Vec3 cameraDir{0.0f, -0.7f, -1.0f};
+        Vec3 cameraRightVec{1.0f, 0.0f, 0.0f};
+        Vec3 cameraUpVec{0.0f, 1.0f, 0.0f};
 
         std::string codeContent =
             "-- Lua script\n"
@@ -244,7 +259,8 @@ namespace
             "Overlays:\n"
             "  Code     - edit lua scripts (auto indent, 4 spaces)\n"
             "  Docs     - read-only documentation (copy button)\n"
-            "  Content  - choose cube presets\n";
+            "  Content  - choose cube presets (Glow Cube emits light)\n"
+            "  Compile  - raytraced preview of lighting\n";
 
         bool showDocs = false;
         bool showContent = false;
@@ -262,6 +278,26 @@ namespace
         GLuint litProgram = 0;
         GLuint gridProgram = 0;
         GLuint backgroundProgram = 0;
+        GLuint glowVao = 0;
+        GLuint glowVbo = 0;
+        GLuint glowProgram = 0;
+        int glowFanVertexCount = 0;
+        bool showRaytrace = false;
+        GLuint raytraceTexture = 0;
+        GLuint raytraceFbo = 0;
+        GLuint raytraceProgram = 0;
+        int raytraceWidth = 512;
+        int raytraceHeight = 512;
+        GLint raytraceLocResolution = -1;
+        GLint raytraceLocCameraPos = -1;
+        GLint raytraceLocCameraDir = -1;
+        GLint raytraceLocCameraRight = -1;
+        GLint raytraceLocCameraUp = -1;
+        GLint raytraceLocFovTan = -1;
+        GLint raytraceLocCubeCount = -1;
+        GLint raytraceLocCubeData = -1;
+        GLint raytraceLocCubeColor = -1;
+        GLint raytraceLocCubeGlow = -1;
 
         Mat4 projection{};
         Mat4 view{};
@@ -269,12 +305,8 @@ namespace
 
     SpawnPreset GetPreset(int index)
     {
-        constexpr SpawnPreset presets[] = {
-            {"Blue Cube", 0.30f, 0.45f, 0.85f},
-            {"Red Cube", 0.85f, 0.35f, 0.35f},
-            {"Grey Cube", 0.65f, 0.65f, 0.65f}};
-        index = std::clamp(index, 0, static_cast<int>(std::size(presets)) - 1);
-        return presets[index];
+        index = std::clamp(index, 0, static_cast<int>(std::size(kSpawnPresets)) - 1);
+        return kSpawnPresets[index];
     }
 
     GLuint CompileShader(GLenum type, const char* source)
@@ -517,6 +549,457 @@ namespace
         glDeleteShader(fs);
     }
 
+    void CreateGlowGeometry(AppState& app)
+    {
+        constexpr int kSegments = 32;
+        constexpr float radius = 1.8f;
+
+        app.glowFanVertexCount = kSegments + 2;
+        std::vector<float> vertices;
+        vertices.reserve((app.glowFanVertexCount * 3) * 4);
+
+        auto addFan = [&](int axis) {
+            // Center vertex with full alpha.
+            vertices.push_back(0.0f);
+            vertices.push_back(0.0f);
+            vertices.push_back(0.0f);
+            vertices.push_back(0.45f);
+            for (int i = 0; i <= kSegments; ++i)
+            {
+                const float theta = (static_cast<float>(i) / static_cast<float>(kSegments)) * 2.0f * 3.1415926535f;
+                const float c = std::cos(theta) * radius;
+                const float s = std::sin(theta) * radius;
+                float x = 0.0f;
+                float y = 0.0f;
+                float z = 0.0f;
+                if (axis == 0) // XY plane
+                {
+                    x = c;
+                    y = s;
+                }
+                else if (axis == 1) // XZ plane
+                {
+                    x = c;
+                    z = s;
+                }
+                else // YZ plane
+                {
+                    y = c;
+                    z = s;
+                }
+                vertices.push_back(x);
+                vertices.push_back(y);
+                vertices.push_back(z);
+                vertices.push_back(0.0f);
+            }
+        };
+
+        addFan(0);
+        addFan(1);
+        addFan(2);
+
+        glGenVertexArrays(1, &app.glowVao);
+        glGenBuffers(1, &app.glowVbo);
+        glBindVertexArray(app.glowVao);
+        glBindBuffer(GL_ARRAY_BUFFER, app.glowVbo);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 4, reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, sizeof(float) * 4, reinterpret_cast<void*>(sizeof(float) * 3));
+        glBindVertexArray(0);
+
+        const char* vsSource =
+            "#version 300 es\n"
+            "layout(location = 0) in vec3 aPos;\n"
+            "layout(location = 1) in float aAlpha;\n"
+            "uniform mat4 uMVP;\n"
+            "out float vAlpha;\n"
+            "void main() {\n"
+            "    vAlpha = aAlpha;\n"
+            "    gl_Position = uMVP * vec4(aPos, 1.0);\n"
+            "}\n";
+
+        const char* fsSource =
+            "#version 300 es\n"
+            "precision mediump float;\n"
+            "in float vAlpha;\n"
+            "uniform vec3 uColor;\n"
+            "out vec4 FragColor;\n"
+            "void main() {\n"
+            "    FragColor = vec4(uColor * vAlpha, vAlpha);\n"
+            "}\n";
+
+        GLuint vs = CompileShader(GL_VERTEX_SHADER, vsSource);
+        GLuint fs = CompileShader(GL_FRAGMENT_SHADER, fsSource);
+        app.glowProgram = LinkProgram(vs, fs);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+    }
+
+    void RenderGlowEffects(AppState& app, const Mat4& vp)
+    {
+        if (app.glowProgram == 0 || app.glowVao == 0 || app.glowFanVertexCount == 0)
+        {
+            return;
+        }
+
+        const GLsizei fanCount = app.glowFanVertexCount;
+        const GLint offsets[3] = {0, fanCount, fanCount * 2};
+
+        glUseProgram(app.glowProgram);
+        GLint mvpLoc = glGetUniformLocation(app.glowProgram, "uMVP");
+        GLint colorLoc = glGetUniformLocation(app.glowProgram, "uColor");
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_CULL_FACE);
+
+        glBindVertexArray(app.glowVao);
+
+        for (const PlacedCube& cube : app.cubes)
+        {
+            if (!cube.glowing)
+            {
+                continue;
+            }
+            Mat4 model = Mat4::Identity();
+            model.m[12] = static_cast<float>(cube.gridX);
+            model.m[13] = 0.5f;
+            model.m[14] = static_cast<float>(cube.gridZ);
+            Mat4 mvp = Multiply(vp, model);
+            glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, mvp.m);
+            glUniform3f(colorLoc, cube.r, cube.g, cube.b);
+            for (int i = 0; i < 3; ++i)
+            {
+                glDrawArrays(GL_TRIANGLE_FAN, offsets[i], fanCount);
+            }
+        }
+
+        glBindVertexArray(0);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glEnable(GL_CULL_FACE);
+        glUseProgram(0);
+    }
+
+    void EnsureRaytraceResources(AppState& app)
+    {
+        if (app.raytraceTexture == 0)
+        {
+            glGenTextures(1, &app.raytraceTexture);
+            glBindTexture(GL_TEXTURE_2D, app.raytraceTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, app.raytraceWidth, app.raytraceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+
+        if (app.raytraceFbo == 0)
+        {
+            glGenFramebuffers(1, &app.raytraceFbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, app.raytraceFbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, app.raytraceTexture, 0);
+            GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (status != GL_FRAMEBUFFER_COMPLETE)
+            {
+                SDL_Log("Raytrace framebuffer incomplete: 0x%x", status);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+
+        if (app.raytraceProgram == 0)
+        {
+            const char* vsSource =
+                "#version 300 es\n"
+                "layout(location = 0) in vec2 aPos;\n"
+                "void main() {\n"
+                "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+                "}\n";
+
+            const char* fsSource =
+                "#version 300 es\n"
+                "precision highp float;\n"
+                "#define MAX_RAYTRACE_CUBES 64\n"
+                "uniform vec2 uResolution;\n"
+                "uniform vec3 uCameraPos;\n"
+                "uniform vec3 uCameraDir;\n"
+                "uniform vec3 uCameraRight;\n"
+                "uniform vec3 uCameraUp;\n"
+                "uniform float uFovTan;\n"
+                "uniform int uCubeCount;\n"
+                "uniform vec4 uCubeData[MAX_RAYTRACE_CUBES];\n"
+                "uniform vec4 uCubeColor[MAX_RAYTRACE_CUBES];\n"
+                "uniform int uCubeGlow[MAX_RAYTRACE_CUBES];\n"
+                "out vec4 FragColor;\n"
+                "\n"
+                "bool IntersectCube(vec3 ro, vec3 rd, vec3 center, out float tHit, out vec3 normal)\n"
+                "{\n"
+                "    vec3 minB = center + vec3(-0.5, 0.0, -0.5);\n"
+                "    vec3 maxB = center + vec3(0.5, 1.0, 0.5);\n"
+                "    vec3 invDir = 1.0 / rd;\n"
+                "    vec3 t0 = (minB - ro) * invDir;\n"
+                "    vec3 t1 = (maxB - ro) * invDir;\n"
+                "    vec3 tmin = min(t0, t1);\n"
+                "    vec3 tmax = max(t0, t1);\n"
+                "    float tNear = max(max(tmin.x, tmin.y), tmin.z);\n"
+                "    float tFar = min(min(tmax.x, tmax.y), tmax.z);\n"
+                "    if (tNear > tFar || tFar < 0.0)\n"
+                "        return false;\n"
+                "    tHit = max(tNear, 0.0);\n"
+                "    vec3 hit = ro + rd * tHit;\n"
+                "    const float eps = 0.001;\n"
+                "    if (abs(hit.x - minB.x) < eps) normal = vec3(-1.0, 0.0, 0.0);\n"
+                "    else if (abs(hit.x - maxB.x) < eps) normal = vec3(1.0, 0.0, 0.0);\n"
+                "    else if (abs(hit.y - minB.y) < eps) normal = vec3(0.0, -1.0, 0.0);\n"
+                "    else if (abs(hit.y - maxB.y) < eps) normal = vec3(0.0, 1.0, 0.0);\n"
+                "    else if (abs(hit.z - minB.z) < eps) normal = vec3(0.0, 0.0, -1.0);\n"
+                "    else normal = vec3(0.0, 0.0, 1.0);\n"
+                "    return true;\n"
+                "}\n"
+                "\n"
+                "bool Occluded(vec3 origin, vec3 dir, float maxT, int ignoreIndex)\n"
+                "{\n"
+                "    float tTmp;\n"
+                "    vec3 nTmp;\n"
+                "    for (int i = 0; i < uCubeCount; ++i)\n"
+                "    {\n"
+                "        if (i == ignoreIndex)\n"
+                "            continue;\n"
+                "        if (IntersectCube(origin, dir, uCubeData[i].xyz, tTmp, nTmp))\n"
+                "        {\n"
+                "            if (tTmp > 0.02 && tTmp < maxT - 0.02)\n"
+                "                return true;\n"
+                "        }\n"
+                "    }\n"
+                "    return false;\n"
+                "}\n"
+                "\n"
+                "vec3 Shade(vec3 pos, vec3 normal, vec3 baseColor, int selfIndex)\n"
+                "{\n"
+                "    vec3 result = baseColor * 0.15;\n"
+                "    for (int i = 0; i < uCubeCount; ++i)\n"
+                "    {\n"
+                "        if (uCubeGlow[i] == 0)\n"
+                "            continue;\n"
+                "        vec3 lightPos = uCubeData[i].xyz;\n"
+                "        vec3 L = lightPos - pos;\n"
+                "        float dist = length(L);\n"
+                "        if (dist < 0.0001)\n"
+                "            continue;\n"
+                "        L /= dist;\n"
+                "        if (Occluded(pos + normal * 0.02, L, dist, i))\n"
+                "            continue;\n"
+                "        float diff = max(dot(normal, L), 0.0);\n"
+                "        float attenuation = 1.0 / (1.0 + dist * 0.6 + dist * dist * 0.15);\n"
+                "        result += baseColor * diff * attenuation * 2.0;\n"
+                "        if (selfIndex == i)\n"
+                "        {\n"
+                "            result += uCubeColor[i].rgb * 0.8;\n"
+                "        }\n"
+                "    }\n"
+                "    return clamp(result, 0.0, 1.0);\n"
+                "}\n"
+                "\n"
+                "vec3 ShadeGround(vec3 pos)\n"
+                "{\n"
+                "    vec3 base = mix(vec3(0.08, 0.08, 0.09), vec3(0.28, 0.29, 0.32), 0.4 + 0.6 * clamp((pos.y + 0.01) * 10.0, 0.0, 1.0));\n"
+                "    vec3 normal = vec3(0.0, 1.0, 0.0);\n"
+                "    vec3 shaded = base * 0.15;\n"
+                "    for (int i = 0; i < uCubeCount; ++i)\n"
+                "    {\n"
+                "        if (uCubeGlow[i] == 0)\n"
+                "            continue;\n"
+                "        vec3 lightPos = uCubeData[i].xyz;\n"
+                "        vec3 L = lightPos - pos;\n"
+                "        float dist = length(L);\n"
+                "        if (dist < 0.0001)\n"
+                "            continue;\n"
+                "        L /= dist;\n"
+                "        if (Occluded(pos + normal * 0.02, L, dist, i))\n"
+                "            continue;\n"
+                "        float diff = max(dot(normal, L), 0.0);\n"
+                "        float attenuation = 1.0 / (1.0 + dist * 0.6 + dist * dist * 0.15);\n"
+                "        shaded += vec3(0.9, 0.9, 1.0) * diff * attenuation * 1.5;\n"
+                "    }\n"
+                "    return clamp(shaded, 0.0, 1.0);\n"
+                "}\n"
+                "\n"
+                "void main()\n"
+                "{\n"
+                "    vec2 uv = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0;\n"
+                "    uv.x *= uResolution.x / uResolution.y;\n"
+                "    vec3 rd = normalize(uCameraDir + uv.x * uCameraRight * uFovTan + uv.y * uCameraUp * uFovTan);\n"
+                "    vec3 ro = uCameraPos;\n"
+                "\n"
+                "    float closestT = 1e9;\n"
+                "    vec3 hitColor = vec3(0.0);\n"
+                "    bool hitSomething = false;\n"
+                "\n"
+                "    float tCube;\n"
+                "    vec3 normalCube;\n"
+                "    int hitIndex = -1;\n"
+                "    for (int i = 0; i < uCubeCount; ++i)\n"
+                "    {\n"
+                "        if (IntersectCube(ro, rd, uCubeData[i].xyz, tCube, normalCube))\n"
+                "        {\n"
+                "            if (tCube < closestT)\n"
+                "            {\n"
+                "                closestT = tCube;\n"
+                "                vec3 pos = ro + rd * tCube;\n"
+                "                hitColor = Shade(pos, normalCube, uCubeColor[i].rgb, i);\n"
+                "                hitSomething = true;\n"
+                "                hitIndex = i;\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "\n"
+                "    vec3 groundNormal = vec3(0.0, 1.0, 0.0);\n"
+                "    if (abs(rd.y) > 1e-4)\n"
+                "    {\n"
+                "        float tGround = (-ro.y) / rd.y;\n"
+                "        if (tGround > 0.0 && tGround < closestT)\n"
+                "        {\n"
+                "            vec3 pos = ro + rd * tGround;\n"
+                "            hitColor = ShadeGround(pos);\n"
+                "            hitSomething = true;\n"
+                "        }\n"
+                "    }\n"
+                "\n"
+                "    if (!hitSomething)\n"
+                "    {\n"
+                "        vec3 top = vec3(0.18, 0.13, 0.25);\n"
+                "        vec3 bottom = vec3(0.03, 0.05, 0.12);\n"
+                "        float t = clamp(uv.y * 0.5 + 0.5, 0.0, 1.0);\n"
+                "        hitColor = mix(bottom, top, t);\n"
+                "    }\n"
+                "\n"
+                "    FragColor = vec4(hitColor, 1.0);\n"
+                "}\n";
+
+            GLuint vs = CompileShader(GL_VERTEX_SHADER, vsSource);
+            GLuint fs = CompileShader(GL_FRAGMENT_SHADER, fsSource);
+            app.raytraceProgram = LinkProgram(vs, fs);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            if (app.raytraceProgram)
+            {
+                app.raytraceLocResolution = glGetUniformLocation(app.raytraceProgram, "uResolution");
+                app.raytraceLocCameraPos = glGetUniformLocation(app.raytraceProgram, "uCameraPos");
+                app.raytraceLocCameraDir = glGetUniformLocation(app.raytraceProgram, "uCameraDir");
+                app.raytraceLocCameraRight = glGetUniformLocation(app.raytraceProgram, "uCameraRight");
+                app.raytraceLocCameraUp = glGetUniformLocation(app.raytraceProgram, "uCameraUp");
+                app.raytraceLocFovTan = glGetUniformLocation(app.raytraceProgram, "uFovTan");
+                app.raytraceLocCubeCount = glGetUniformLocation(app.raytraceProgram, "uCubeCount");
+                app.raytraceLocCubeData = glGetUniformLocation(app.raytraceProgram, "uCubeData");
+                app.raytraceLocCubeColor = glGetUniformLocation(app.raytraceProgram, "uCubeColor");
+                app.raytraceLocCubeGlow = glGetUniformLocation(app.raytraceProgram, "uCubeGlow");
+            }
+        }
+    }
+
+    void CompileRaytracedScene(AppState& app)
+    {
+        EnsureRaytraceResources(app);
+        if (app.raytraceProgram == 0 || app.raytraceFbo == 0)
+        {
+            return;
+        }
+
+        std::array<float, kMaxRaytraceCubes * 4> cubeData{};
+        std::array<float, kMaxRaytraceCubes * 4> cubeColors{};
+        std::array<int, kMaxRaytraceCubes> cubeGlow{};
+
+        int cubeCount = 0;
+        for (const PlacedCube& cube : app.cubes)
+        {
+            if (cubeCount >= kMaxRaytraceCubes)
+            {
+                break;
+            }
+            const int index = cubeCount * 4;
+            cubeData[index + 0] = static_cast<float>(cube.gridX);
+            cubeData[index + 1] = 0.5f;
+            cubeData[index + 2] = static_cast<float>(cube.gridZ);
+            cubeData[index + 3] = 1.0f;
+
+            cubeColors[index + 0] = cube.r;
+            cubeColors[index + 1] = cube.g;
+            cubeColors[index + 2] = cube.b;
+            cubeColors[index + 3] = 1.0f;
+
+            cubeGlow[cubeCount] = cube.glowing ? 1 : 0;
+            ++cubeCount;
+        }
+
+        GLint previousFbo = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousFbo);
+        GLint previousViewport[4];
+        glGetIntegerv(GL_VIEWPORT, previousViewport);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, app.raytraceFbo);
+        glViewport(0, 0, app.raytraceWidth, app.raytraceHeight);
+        glUseProgram(app.raytraceProgram);
+
+        if (app.raytraceLocResolution >= 0)
+        {
+            glUniform2f(app.raytraceLocResolution, static_cast<float>(app.raytraceWidth), static_cast<float>(app.raytraceHeight));
+        }
+        if (app.raytraceLocCameraPos >= 0)
+        {
+            glUniform3f(app.raytraceLocCameraPos, app.cameraEye.x, app.cameraEye.y, app.cameraEye.z);
+        }
+        if (app.raytraceLocCameraDir >= 0)
+        {
+            glUniform3f(app.raytraceLocCameraDir, app.cameraDir.x, app.cameraDir.y, app.cameraDir.z);
+        }
+        if (app.raytraceLocCameraRight >= 0)
+        {
+            glUniform3f(app.raytraceLocCameraRight, app.cameraRightVec.x, app.cameraRightVec.y, app.cameraRightVec.z);
+        }
+        if (app.raytraceLocCameraUp >= 0)
+        {
+            glUniform3f(app.raytraceLocCameraUp, app.cameraUpVec.x, app.cameraUpVec.y, app.cameraUpVec.z);
+        }
+        if (app.raytraceLocFovTan >= 0)
+        {
+            float tanHalfFov = std::tan(60.0f * (3.1415926535f / 180.0f) * 0.5f);
+            glUniform1f(app.raytraceLocFovTan, tanHalfFov);
+        }
+        if (app.raytraceLocCubeCount >= 0)
+        {
+            glUniform1i(app.raytraceLocCubeCount, cubeCount);
+        }
+        if (cubeCount > 0)
+        {
+            if (app.raytraceLocCubeData >= 0)
+            {
+                glUniform4fv(app.raytraceLocCubeData, cubeCount, cubeData.data());
+            }
+            if (app.raytraceLocCubeColor >= 0)
+            {
+                glUniform4fv(app.raytraceLocCubeColor, cubeCount, cubeColors.data());
+            }
+            if (app.raytraceLocCubeGlow >= 0)
+            {
+                glUniform1iv(app.raytraceLocCubeGlow, cubeCount, cubeGlow.data());
+            }
+        }
+
+        glBindVertexArray(app.backgroundVao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, previousFbo);
+        glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
+        glUseProgram(0);
+
+        app.showRaytrace = true;
+    }
+
     bool HandleEvents(AppState& app)
     {
         SDL_Event event;
@@ -591,13 +1074,14 @@ namespace
                         const SpawnPreset preset = GetPreset(app.selectedPreset);
                         if (it == app.cubes.end())
                         {
-                            app.cubes.push_back({gridX, gridZ, preset.r, preset.g, preset.b});
+                            app.cubes.push_back({gridX, gridZ, preset.r, preset.g, preset.b, preset.glowing});
                         }
                         else
                         {
                             it->r = preset.r;
                             it->g = preset.g;
                             it->b = preset.b;
+                            it->glowing = preset.glowing;
                         }
                     }
                     else if (event.button.button == SDL_BUTTON_RIGHT)
@@ -646,7 +1130,15 @@ namespace
         const float cameraHeight = std::sin(pitchRadians) * app.cameraDistance;
         const float cameraForward = std::cos(pitchRadians) * app.cameraDistance;
         const Vec3 eye{app.cameraFocus.x, cameraHeight, app.cameraFocus.z + cameraForward};
-        app.view = LookAt(eye, Vec3{app.cameraFocus.x, 0.0f, app.cameraFocus.z}, Vec3{0.0f, 1.0f, 0.0f});
+        const Vec3 target{app.cameraFocus.x, 0.0f, app.cameraFocus.z};
+        const Vec3 forward = Vec3::Normalize(target - eye);
+        const Vec3 right = Vec3::Normalize(Vec3::Cross(forward, Vec3{0.0f, 1.0f, 0.0f}));
+        const Vec3 up = Vec3::Cross(right, forward * -1.0f);
+        app.cameraEye = eye;
+        app.cameraDir = forward;
+        app.cameraRightVec = right;
+        app.cameraUpVec = up;
+        app.view = LookAt(eye, target, Vec3{0.0f, 1.0f, 0.0f});
         const float aspect = static_cast<float>(app.windowWidth) / static_cast<float>(app.windowHeight);
         app.projection = Perspective(60.0f * (3.1415926535f / 180.0f), aspect, 0.1f, 100.0f);
     }
@@ -695,6 +1187,8 @@ namespace
         }
 
         renderCubeAt(app.cameraFocus.x, 0.5f, app.cameraFocus.z, Vec3{0.6f, 0.7f, 1.0f});
+
+        RenderGlowEffects(app, vp);
     }
 
     const std::unordered_set<std::string> kLuaKeywords = {
@@ -862,6 +1356,11 @@ namespace
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "unsaved");
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Compile Scene"))
+        {
+            CompileRaytracedScene(app);
+        }
         ImGui::End();
 
         const float panelWidth = std::max(360.0f, static_cast<float>(app.windowWidth) * 0.38f);
@@ -1009,7 +1508,7 @@ namespace
             ImGui::Separator();
             ImGui::TextWrapped("Select a preset and click on the grid to spawn it. Right click removes cubes.");
             ImGui::Spacing();
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < static_cast<int>(std::size(kSpawnPresets)); ++i)
             {
                 SpawnPreset preset = GetPreset(i);
                 ImVec4 color(preset.r, preset.g, preset.b, 1.0f);
@@ -1020,7 +1519,35 @@ namespace
                 {
                     app.selectedPreset = i;
                 }
+                if (preset.glowing)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "glow");
+                }
                 ImGui::PopID();
+            }
+            ImGui::End();
+        }
+
+        if (app.showRaytrace && app.raytraceTexture != 0)
+        {
+            ImGui::SetNextWindowSize(ImVec2(560.0f, 600.0f), ImGuiCond_Appearing);
+            if (ImGui::Begin("Raytrace Preview", &app.showRaytrace, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings))
+            {
+                ImGui::TextUnformatted("Path-traced lighting preview");
+                ImGui::Separator();
+                ImVec2 avail = ImGui::GetContentRegionAvail();
+                float aspect = static_cast<float>(app.raytraceHeight) > 0 ? static_cast<float>(app.raytraceWidth) / static_cast<float>(app.raytraceHeight) : 1.0f;
+                ImVec2 imageSize = avail;
+                if (imageSize.y > imageSize.x / aspect)
+                {
+                    imageSize.y = imageSize.x / aspect;
+                }
+                else
+                {
+                    imageSize.x = imageSize.y * aspect;
+                }
+                ImGui::Image(reinterpret_cast<ImTextureID>(static_cast<intptr_t>(app.raytraceTexture)), imageSize, ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
             }
             ImGui::End();
         }
@@ -1051,6 +1578,18 @@ namespace
             glDeleteVertexArrays(1, &app.backgroundVao);
         if (app.backgroundVbo)
             glDeleteBuffers(1, &app.backgroundVbo);
+        if (app.glowVao)
+            glDeleteVertexArrays(1, &app.glowVao);
+        if (app.glowVbo)
+            glDeleteBuffers(1, &app.glowVbo);
+        if (app.glowProgram)
+            glDeleteProgram(app.glowProgram);
+        if (app.raytraceProgram)
+            glDeleteProgram(app.raytraceProgram);
+        if (app.raytraceTexture)
+            glDeleteTextures(1, &app.raytraceTexture);
+        if (app.raytraceFbo)
+            glDeleteFramebuffers(1, &app.raytraceFbo);
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplSDL2_Shutdown();
         ImGui::DestroyContext();
@@ -1137,6 +1676,7 @@ int main(int, char**)
     CreateBackground(app);
     CreateCube(app);
     CreateGrid(app, 10, 1.0f);
+    CreateGlowGeometry(app);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

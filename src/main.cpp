@@ -37,6 +37,7 @@ namespace
         float r;
         float g;
         float b;
+        bool glowing = false;
     };
 
     struct GameState
@@ -116,7 +117,8 @@ namespace
         "Code Panel:\n"
         "  Use Save button to persist notes.txt\n\n"
         "Content Panel:\n"
-        "  Toggle 'Content' to pick cube presets for spawning\n\n"
+        "  Toggle 'Content' to pick cube presets for spawning\n"
+        "  Glow Cube emits light and casts shadows around the grid\n\n"
         "Environment Panel:\n"
         "  Adjust sky gradient colors in real time\n";
 
@@ -150,13 +152,13 @@ namespace
     Vec3 CameraForward2D()
     {
         const float yawRadians = g_cameraYawDegrees * (kPi / 180.0f);
-        return Vec3{std::sin(yawRadians), 0.0f, std::cos(yawRadians)};
+        return Vec3{-std::sin(yawRadians), 0.0f, -std::cos(yawRadians)};
     }
 
     Vec3 CameraRight2D()
     {
         Vec3 forward = CameraForward2D();
-        return Vec3{forward.z, 0.0f, -forward.x};
+        return Vec3{-forward.z, 0.0f, forward.x};
     }
 
     void NormalizeAngle(float& angle)
@@ -171,18 +173,36 @@ namespace
         }
     }
 
+    float ShortestAngleDelta(float from, float to)
+    {
+        float delta = to - from;
+        while (delta > 180.0f)
+        {
+            delta -= 360.0f;
+        }
+        while (delta < -180.0f)
+        {
+            delta += 360.0f;
+        }
+        return delta;
+    }
+
     struct SpawnPreset
     {
         const char* name;
         float r;
         float g;
         float b;
+        bool glowing;
     };
 
+    float ComputeLightAtPoint(const Vec3& point, const PlacedCube* receiver = nullptr);
+
     constexpr SpawnPreset kSpawnPresets[] = {
-        {"Blue Cube", 0.3f, 0.45f, 0.85f},
-        {"Red Cube", 0.85f, 0.35f, 0.35f},
-        {"Grey Cube", 0.65f, 0.65f, 0.65f},
+        {"Blue Cube", 0.3f, 0.45f, 0.85f, false},
+        {"Red Cube", 0.85f, 0.35f, 0.35f, false},
+        {"Grey Cube", 0.65f, 0.65f, 0.65f, false},
+        {"Glow Cube", 1.0f, 0.92f, 0.5f, true},
     };
     int g_selectedPresetIndex = 2;
 
@@ -231,7 +251,7 @@ namespace
         {
             return;
         }
-        g_placedCubes.push_back({x, y, z, preset.r, preset.g, preset.b});
+        g_placedCubes.push_back({x, y, z, preset.r, preset.g, preset.b, preset.glowing});
     }
 
     void RemoveCube(int x, int y, int z)
@@ -772,14 +792,38 @@ namespace
     void RenderGround()
     {
         glDisable(GL_LIGHTING);
-        glColor3f(0.2f, 0.2f, 0.2f);
+        const float cellSize = kGridCellSize;
+        const float shadowBase[3] = {0.08f, 0.08f, 0.09f};
+        const float litBase[3] = {0.28f, 0.29f, 0.32f};
+
         glBegin(GL_QUADS);
-        const float extent = static_cast<float>(kGridHalfSize) * kGridCellSize;
-        glVertex3f(-extent, 0.0f, -extent);
-        glVertex3f(extent, 0.0f, -extent);
-        glVertex3f(extent, 0.0f, extent);
-        glVertex3f(-extent, 0.0f, extent);
+        for (int x = -kGridHalfSize; x < kGridHalfSize; ++x)
+        {
+            const float cellMinX = static_cast<float>(x) * cellSize;
+            const float cellMaxX = cellMinX + cellSize;
+            const float sampleX = cellMinX + cellSize * 0.5f;
+
+            for (int z = -kGridHalfSize; z < kGridHalfSize; ++z)
+            {
+                const float cellMinZ = static_cast<float>(z) * cellSize;
+                const float cellMaxZ = cellMinZ + cellSize;
+                const float sampleZ = cellMinZ + cellSize * 0.5f;
+
+                Vec3 samplePoint{sampleX, 0.05f, sampleZ};
+                const float light = ComputeLightAtPoint(samplePoint, nullptr);
+                const float r = shadowBase[0] + (litBase[0] - shadowBase[0]) * light;
+                const float g = shadowBase[1] + (litBase[1] - shadowBase[1]) * light;
+                const float b = shadowBase[2] + (litBase[2] - shadowBase[2]) * light;
+                glColor3f(r, g, b);
+
+                glVertex3f(cellMinX, 0.0f, cellMinZ);
+                glVertex3f(cellMaxX, 0.0f, cellMinZ);
+                glVertex3f(cellMaxX, 0.0f, cellMaxZ);
+                glVertex3f(cellMinX, 0.0f, cellMaxZ);
+            }
+        }
         glEnd();
+
         glEnable(GL_LIGHTING);
     }
 
@@ -814,14 +858,157 @@ namespace
         glEnd();
     }
 
+    void RenderGlowAura(const PlacedCube& cube)
+    {
+        glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDisable(GL_LIGHTING);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDepthMask(GL_FALSE);
+
+        glPushMatrix();
+        glTranslatef(static_cast<float>(cube.gridX), static_cast<float>(cube.gridY) + 0.5f, static_cast<float>(cube.gridZ));
+
+        constexpr int kSegments = 32;
+        const float radius = 1.8f;
+        auto drawDisk = [&](float angle, float axisX, float axisY, float axisZ) {
+            glPushMatrix();
+            if (angle != 0.0f)
+            {
+                glRotatef(angle, axisX, axisY, axisZ);
+            }
+            glBegin(GL_TRIANGLE_FAN);
+            glColor4f(cube.r, cube.g, cube.b, 0.45f);
+            glVertex3f(0.0f, 0.0f, 0.0f);
+            glColor4f(cube.r, cube.g, cube.b, 0.0f);
+            for (int i = 0; i <= kSegments; ++i)
+            {
+                const float theta = (static_cast<float>(i) / static_cast<float>(kSegments)) * 2.0f * kPi;
+                const float px = std::cos(theta) * radius;
+                const float py = std::sin(theta) * radius;
+                glVertex3f(px, py, 0.0f);
+            }
+            glEnd();
+            glPopMatrix();
+        };
+
+        drawDisk(0.0f, 1.0f, 0.0f, 0.0f);   // XY plane
+        drawDisk(90.0f, 1.0f, 0.0f, 0.0f);  // XZ plane
+        drawDisk(90.0f, 0.0f, 1.0f, 0.0f);  // YZ plane
+
+        glPopMatrix();
+
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glPopAttrib();
+    }
+
+    bool IsLightOccluded(const Vec3& origin, const Vec3& target, const PlacedCube* lightCube, const PlacedCube* receiver)
+    {
+        Vec3 dir = target - origin;
+        const float dirLengthSq = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z;
+        if (dirLengthSq < 1e-6f)
+        {
+            return false;
+        }
+
+        for (const PlacedCube& cube : g_placedCubes)
+        {
+            if (&cube == lightCube || &cube == receiver)
+            {
+                continue;
+            }
+
+            Vec3 minB{static_cast<float>(cube.gridX) - 0.5f, static_cast<float>(cube.gridY), static_cast<float>(cube.gridZ) - 0.5f};
+            Vec3 maxB{static_cast<float>(cube.gridX) + 0.5f, static_cast<float>(cube.gridY) + 1.0f, static_cast<float>(cube.gridZ) + 0.5f};
+            float t = 0.0f;
+            Vec3 normal;
+            if (RayIntersectsAABB(origin, dir, minB, maxB, t, normal))
+            {
+                if (t > 1e-4f && t < 1.0f)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    float ComputeLightAtPoint(const Vec3& point, const PlacedCube* receiver)
+    {
+        float total = 0.2f;
+        bool hasGlow = false;
+
+        for (const PlacedCube& glow : g_placedCubes)
+        {
+            if (!glow.glowing)
+            {
+                continue;
+            }
+
+            hasGlow = true;
+            Vec3 lightPos{
+                static_cast<float>(glow.gridX),
+                static_cast<float>(glow.gridY) + 0.5f,
+                static_cast<float>(glow.gridZ)};
+
+            if (IsLightOccluded(lightPos, point, &glow, receiver))
+            {
+                continue;
+            }
+
+            Vec3 delta = point - lightPos;
+            const float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+            if (distSq < 1e-4f)
+            {
+                total += 1.0f;
+                continue;
+            }
+
+            constexpr float kIntensity = 2.6f;
+            constexpr float kFalloff = 0.45f;
+            const float contribution = kIntensity / (1.0f + distSq * kFalloff);
+            total += contribution;
+        }
+
+        if (!hasGlow)
+        {
+            return 0.35f;
+        }
+
+        return std::clamp(total, 0.0f, 1.0f);
+    }
+
     void RenderPlacedCubes(const Mesh& mesh)
     {
+        const GLfloat kNoEmission[] = {0.0f, 0.0f, 0.0f, 1.0f};
         for (const PlacedCube& cube : g_placedCubes)
         {
             glPushMatrix();
             glTranslatef(static_cast<float>(cube.gridX), static_cast<float>(cube.gridY) + 0.5f, static_cast<float>(cube.gridZ));
-            RenderMesh(mesh, cube.r, cube.g, cube.b);
+            Vec3 samplePos{static_cast<float>(cube.gridX), static_cast<float>(cube.gridY) + 0.5f, static_cast<float>(cube.gridZ)};
+            const float lightAmount = cube.glowing ? 1.0f : ComputeLightAtPoint(samplePos, &cube);
+            const float shading = std::clamp(0.4f + 0.6f * lightAmount, 0.2f, 1.0f);
+            const float shadedR = std::clamp(cube.r * shading, 0.0f, 1.0f);
+            const float shadedG = std::clamp(cube.g * shading, 0.0f, 1.0f);
+            const float shadedB = std::clamp(cube.b * shading, 0.0f, 1.0f);
+            if (cube.glowing)
+            {
+                const GLfloat emission[] = {cube.r * 0.6f, cube.g * 0.6f, cube.b * 0.6f, 1.0f};
+                glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, emission);
+            }
+            RenderMesh(mesh, shadedR, shadedG, shadedB);
+            if (cube.glowing)
+            {
+                glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, kNoEmission);
+            }
             glPopMatrix();
+
+            if (cube.glowing)
+            {
+                RenderGlowAura(cube);
+            }
         }
     }
 
@@ -1084,7 +1271,9 @@ namespace
         glTranslatef(g_game.cubeX, g_game.cubeY + 0.5f, g_game.cubeZ);
         glRotatef(g_game.rotation, 0.0f, 1.0f, 0.0f);
         glRotatef(g_game.rotation * 0.5f, 1.0f, 0.0f, 0.0f);
-        RenderMesh(mesh);
+        const float playerLight = ComputeLightAtPoint(Vec3{g_game.cubeX, g_game.cubeY + 0.5f, g_game.cubeZ}, nullptr);
+        const float playerShade = std::clamp(0.5f + 0.5f * playerLight, 0.3f, 1.0f);
+        RenderMesh(mesh, 0.6f * playerShade, 0.7f * playerShade, 1.0f * playerShade);
         glPopMatrix();
     }
 
@@ -1198,23 +1387,27 @@ namespace
             case VK_SPACE:
                 g_jumpRequested = true;
                 return 0;
-                case VK_UP:
-                    g_moveForward = true;
-                    return 0;
-                case VK_DOWN:
-                    g_moveBackward = true;
-                    return 0;
-                case VK_LEFT:
-                    g_moveLeft = true;
-                    return 0;
-                case VK_RIGHT:
-                    g_moveRight = true;
-                    return 0;
-                case 'Q':
-                    g_cameraYawTarget -= 90.0f;
-                    NormalizeAngle(g_cameraYawTarget);
-                    return 0;
-                case 'E':
+            case VK_UP:
+            case 'W':
+                g_moveForward = true;
+                return 0;
+            case VK_DOWN:
+            case 'S':
+                g_moveBackward = true;
+                return 0;
+            case VK_LEFT:
+            case 'A':
+                g_moveLeft = true;
+                return 0;
+            case VK_RIGHT:
+            case 'D':
+                g_moveRight = true;
+                return 0;
+            case 'Q':
+                g_cameraYawTarget -= 90.0f;
+                NormalizeAngle(g_cameraYawTarget);
+                return 0;
+            case 'E':
                     g_cameraYawTarget += 90.0f;
                     NormalizeAngle(g_cameraYawTarget);
                     return 0;
@@ -1227,15 +1420,19 @@ namespace
             switch (wParam)
             {
             case VK_UP:
+            case 'W':
                 g_moveForward = false;
                 return 0;
             case VK_DOWN:
+            case 'S':
                 g_moveBackward = false;
                 return 0;
             case VK_LEFT:
+            case 'A':
                 g_moveLeft = false;
                 return 0;
             case VK_RIGHT:
+            case 'D':
                 g_moveRight = false;
                 return 0;
             default:
@@ -1681,11 +1878,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 {
                     g_selectedPresetIndex = i;
                 }
-            ImGui::PopID();
-        }
+                if (preset.glowing)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "glow");
+                }
+                ImGui::PopID();
+            }
 
-        ImGui::End();
-    }
+            ImGui::End();
+        }
 
         if (g_showEnvironmentPanel)
         {
@@ -1734,7 +1936,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         UpdateProjection(renderWidth, renderHeight);
 
         RenderGradientBackground();
-        const float yawDifference = g_cameraYawTarget - g_cameraYawDegrees;
+        const float yawDifference = ShortestAngleDelta(g_cameraYawDegrees, g_cameraYawTarget);
         const float maxDelta = kCameraRotationSpeed * deltaTime;
         const float clampedDelta = std::clamp(yawDifference, -maxDelta, maxDelta);
         g_cameraYawDegrees += clampedDelta;
