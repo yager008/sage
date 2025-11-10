@@ -1,7 +1,7 @@
 CXX := x86_64-w64-mingw32-g++
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wpedantic -I./imgui -I./imgui/backends -I./imgui/misc/cpp
 LDFLAGS := -lopengl32 -lglu32 -lgdi32 -luser32 -limm32 -ldwmapi -lgdiplus
-TARGET := build/opengl-demo.exe
+TARGET := build/gyge_v1.exe
 IMGUI_DIR := imgui
 IMGUI_SOURCES := \
 	$(IMGUI_DIR)/imgui.cpp \

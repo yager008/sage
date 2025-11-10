@@ -44,3 +44,10 @@ This document is maintained by the Codex agent to explain every code change, rat
 - Reworked world interaction so blocks have full 3D coordinates: left click adds to any face (including new floor blocks below the grid), right click removes the top-most block in a column, and the player now walks, jumps, and collides smoothly against the tower of blocks.
 - Camera rotation can now be smoothly tweened in 90° increments via the `Q`/`E` keys while orbiting around the world origin; character movement re-aligns with the camera heading.
 - Added a `webgl/` target that rewrites the engine around SDL2/OpenGL ES 3 + ImGui backends so it can be compiled with Emscripten and embedded in a browser. Includes shader-based rendering, the same code/docs/content overlays, Lua syntax highlighting, and cube placement logic ported to modern GL.
+
+### Change Set – Texture System & Scene Persistence
+
+- Added PNG texture loading per preset inside the Content Browser. Each block type has a path field (`texture.png` hint), **Load PNG** button that normalises paths relative to the exe folder, and **Clear** to reset. Status text and resolution readout confirm successful uploads. (Win32 only for now.)
+- Introduced a drag-and-drop editor: long-press LMB on any cube to grab it, a violet outline tracks valid placement, and the block follows the cursor until released. Invalid drops snap back; drag state uses `SetCapture` so you can move outside the window.
+- All placed cubes now remember `presetIndex`, glow/transparent flags, texture handle, and relative texture path. Scene state persists to `scene.txt` (same directory as the exe). On startup, cubes + textures auto-load; on close, any modifications flush to disk after the notes save.
+- Updated controls overlay/docs to mention R/F pitch adjustments, Content toggle, texture workflow, and the new `C` hotkey for showing the Content Browser.

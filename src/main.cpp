@@ -15,6 +15,11 @@
 #include <unordered_set>
 #include <cstring>
 #include <cctype>
+#include <filesystem>
+#include <sstream>
+#include <iomanip>
+#include <filesystem>
+#include <sstream>
 
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
@@ -29,9 +34,9 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace
 {
-    constexpr int kInvalidTextureHandle = -1;
+    constexpr int kInvalidTextureHandle = -1; // Used when a cube has no PNG texture assigned.
 
-    ULONG_PTR g_gdiplusToken = 0;
+    ULONG_PTR g_gdiplusToken = 0; // Shared GDI+ session for PNG decoding.
 
     bool EnsureGdiplusInitialized()
     {
@@ -231,6 +236,7 @@ namespace
         g_loadedTextures.clear();
     }
 
+    // CPU-side copy of the cube mesh. Each vertex stores position, normal, UV for retro GL.
     struct Mesh
     {
         std::vector<float> vertices; // xyz triplets
@@ -238,6 +244,7 @@ namespace
         std::vector<float> texcoords; // uv pairs
     };
 
+    // Runtime state for a block dropped into the world. Each cube remembers its texture handle.
     struct PlacedCube
     {
         int gridX;
@@ -249,6 +256,8 @@ namespace
         bool glowing = false;
         bool transparent = false;
         int textureHandle = kInvalidTextureHandle;
+        int presetIndex = -1;
+        std::string texturePath;
     };
 
     struct GameState
@@ -312,28 +321,17 @@ namespace
         }
     };
 
+    std::string g_exeDirectory;
     std::string g_notesFilePath;
+    std::string g_sceneFilePath;
+    bool g_sceneSuppressSave = false;
     std::string g_notesContent;
     bool g_notesDirty = false;
     bool g_showDocs = false;
     std::string g_docsContent =
-        "VEngine Engine Docs\n"
-        "====================\n\n"
-        "Controls:\n"
-        "  Arrow keys - move cube on grid\n"
-        "  Space      - jump\n\n"
-        "Rendering:\n"
-        "  Fixed pipeline OpenGL 1.x\n"
-        "  Retro post-process via glReadPixels/glDrawPixels\n\n"
-        "Code Panel:\n"
-        "  Use Save button to persist notes.txt\n\n"
-        "Content Panel:\n"
-        "  Toggle 'Content' to pick cube presets for spawning\n"
-        "  Glow Cube emits light and casts shadows around the grid\n"
-        "  Glass Cube blocks movement but lets light shine through\n"
-        "  Use Load PNG to apply a texture to new cubes\n\n"
-        "Environment Panel:\n"
-        "  Adjust sky gradient colors in real time\n";
+        "GYGE - Gerasin Yaroslav Game Engine\n"
+        "Version 0.001\n"
+        "Last update: 10.11.2025\n";
 
     float g_cameraYawDegrees = 0.0f;
     float g_cameraYawTarget = 0.0f;
@@ -366,6 +364,7 @@ namespace
     constexpr float kPlayerRadius = 0.35f;
     constexpr float kPlayerHeight = 1.0f;
     constexpr float kStepHeight = 1.0f;
+    // State machine for the long-press “pick up & drag” feature.
     bool g_draggingCube = false;
     PlacedCube g_draggedCube;
     bool g_dragPreviewValid = false;
@@ -380,6 +379,8 @@ namespace
     double g_pendingDragStartTime = 0.0;
     constexpr int kDragStartPixelThreshold = 4;
     constexpr double kDragStartHoldSeconds = 0.12;
+
+    bool g_sceneDirty = false;
 
     Vec3 CameraForward2D()
     {
@@ -435,19 +436,15 @@ namespace
         {"Blue Cube", 0.3f, 0.45f, 0.85f, false, false},
         {"Red Cube", 0.85f, 0.35f, 0.35f, false, false},
         {"Grey Cube", 0.65f, 0.65f, 0.65f, false, false},
+        {"Green Cube", 0.35f, 0.75f, 0.45f, false, false},
         {"Glow Cube", 1.0f, 0.92f, 0.5f, true, false},
         {"Glass Cube", 0.75f, 0.9f, 1.0f, false, true},
     };
     int g_selectedPresetIndex = 2;
 
-    SpawnPreset GetSelectedPreset()
-    {
-        const int clamped = std::clamp(g_selectedPresetIndex, 0, static_cast<int>(std::size(kSpawnPresets)) - 1);
-        return kSpawnPresets[clamped];
-    }
-
     constexpr size_t kSpawnPresetCount = std::size(kSpawnPresets);
 
+    // Current texture handle/status per preset (managed by the Content Browser).
     std::array<int, kSpawnPresetCount> g_presetTextureHandles = [] {
         std::array<int, kSpawnPresetCount> handles{};
         handles.fill(kInvalidTextureHandle);
@@ -486,7 +483,15 @@ namespace
         return bestIndex;
     }
 
-    void PlaceCube(int x, int y, int z, const SpawnPreset& preset, int textureHandle)
+    void MarkSceneDirty()
+    {
+        if (!g_sceneSuppressSave)
+        {
+            g_sceneDirty = true;
+        }
+    }
+
+    void PlaceCube(int x, int y, int z, const SpawnPreset& preset, int presetIndex, int textureHandle, const std::string& texturePath)
     {
         if (std::abs(x) > 100 || std::abs(z) > 100)
         {
@@ -496,7 +501,9 @@ namespace
         {
             return;
         }
-        g_placedCubes.push_back({x, y, z, preset.r, preset.g, preset.b, preset.glowing, preset.transparent, textureHandle});
+        PlacedCube cube{x, y, z, preset.r, preset.g, preset.b, preset.glowing, preset.transparent, textureHandle, presetIndex, texturePath};
+        g_placedCubes.push_back(std::move(cube));
+        MarkSceneDirty();
     }
 
     void RemoveCube(int x, int y, int z)
@@ -505,6 +512,7 @@ namespace
         if (index >= 0)
         {
             g_placedCubes.erase(g_placedCubes.begin() + index);
+            MarkSceneDirty();
         }
     }
 
@@ -769,13 +777,19 @@ namespace
         {
             return;
         }
+        bool appliedNewPosition = false;
         if (commit && g_dragPreviewValid && g_dragPreviewHasPosition)
         {
             g_draggedCube.gridX = g_dragPreviewX;
             g_draggedCube.gridY = g_dragPreviewY;
             g_draggedCube.gridZ = g_dragPreviewZ;
+            appliedNewPosition = true;
         }
         g_placedCubes.push_back(g_draggedCube);
+        if (appliedNewPosition)
+        {
+            MarkSceneDirty();
+        }
         g_draggingCube = false;
         g_dragPreviewValid = false;
         g_dragPreviewHasPosition = false;
@@ -942,8 +956,12 @@ namespace
         return dist(g_rng);
     }
 
-    std::string BuildNotesFilePath()
+    std::string GetExecutableDirectory()
     {
+        if (!g_exeDirectory.empty())
+        {
+            return g_exeDirectory;
+        }
         char pathBuffer[MAX_PATH] = {};
         const DWORD length = GetModuleFileNameA(nullptr, pathBuffer, static_cast<DWORD>(std::size(pathBuffer)));
         std::string path(pathBuffer, length);
@@ -956,8 +974,83 @@ namespace
         {
             path.clear();
         }
+        g_exeDirectory = path;
+        return g_exeDirectory;
+    }
+
+    std::string BuildNotesFilePath()
+    {
+        std::string path = GetExecutableDirectory();
         path.append("notes.txt");
         return path;
+    }
+
+    std::string BuildSceneFilePath()
+    {
+        std::string path = GetExecutableDirectory();
+        path.append("scene.txt");
+        return path;
+    }
+
+    std::string MakeAbsoluteTexturePath(const std::string& storedPath)
+    {
+        if (storedPath.empty())
+        {
+            return {};
+        }
+        namespace fs = std::filesystem;
+        fs::path base(GetExecutableDirectory());
+        fs::path rel(storedPath);
+        fs::path combined = rel.is_absolute() ? rel : (base / rel);
+        return combined.string();
+    }
+
+    bool NormalizeTextureInputPath(const std::string& inputPath, std::string& relativeOut, std::string& statusOut)
+    {
+        if (inputPath.empty())
+        {
+            statusOut = "Path is empty";
+            return false;
+        }
+
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path base(GetExecutableDirectory());
+        fs::path canonicalBase = fs::weakly_canonical(base, ec);
+        if (ec)
+        {
+            statusOut = "Cannot resolve exe directory";
+            return false;
+        }
+
+        fs::path candidate(inputPath);
+        if (!candidate.is_absolute())
+        {
+            candidate = canonicalBase / candidate;
+        }
+        fs::path canonicalCandidate = fs::weakly_canonical(candidate, ec);
+        if (ec)
+        {
+            statusOut = "Invalid path";
+            return false;
+        }
+
+        fs::path relative = fs::relative(canonicalCandidate, canonicalBase, ec);
+        if (ec)
+        {
+            statusOut = "Texture must be inside exe directory";
+            return false;
+        }
+        std::string rel = relative.generic_string();
+        if (rel.empty() || rel.rfind("..", 0) == 0)
+        {
+            statusOut = "Texture must stay inside exe directory";
+            return false;
+        }
+
+        relativeOut = rel;
+        statusOut.clear();
+        return true;
     }
 
     void LoadNotesFromFile()
@@ -994,6 +1087,115 @@ namespace
         }
         file.write(g_notesContent.data(), static_cast<std::streamsize>(g_notesContent.size()));
         g_notesDirty = false;
+    }
+
+    bool SaveSceneToFile()
+    {
+        if (g_sceneFilePath.empty() || g_sceneSuppressSave)
+        {
+            return false;
+        }
+
+        std::ofstream file(g_sceneFilePath, std::ios::binary);
+        if (!file)
+        {
+            return false;
+        }
+
+        file << "VENGINE_SCENE 1\n";
+        file << g_placedCubes.size() << '\n';
+        for (const PlacedCube& cube : g_placedCubes)
+        {
+            file << cube.gridX << ' '
+                 << cube.gridY << ' '
+                 << cube.gridZ << ' '
+                 << cube.r << ' '
+                 << cube.g << ' '
+                 << cube.b << ' '
+                 << (cube.glowing ? 1 : 0) << ' '
+                 << (cube.transparent ? 1 : 0) << ' '
+                 << cube.presetIndex << ' '
+                 << std::quoted(cube.texturePath) << '\n';
+        }
+        g_sceneDirty = false;
+        return true;
+    }
+
+    void LoadSceneFromFile()
+    {
+        if (g_sceneFilePath.empty())
+        {
+            return;
+        }
+
+        g_sceneSuppressSave = true;
+        g_placedCubes.clear();
+
+        std::ifstream file(g_sceneFilePath, std::ios::binary);
+        if (!file)
+        {
+            g_sceneSuppressSave = false;
+            g_sceneDirty = false;
+            return;
+        }
+
+        std::string header;
+        int version = 0;
+        file >> header >> version;
+        if (header != "VENGINE_SCENE" || version != 1)
+        {
+            g_sceneSuppressSave = false;
+            g_sceneDirty = false;
+            return;
+        }
+
+        size_t cubeCount = 0;
+        file >> cubeCount;
+        file.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+        for (size_t i = 0; i < cubeCount; ++i)
+        {
+            std::string line;
+            if (!std::getline(file, line))
+            {
+                break;
+            }
+            if (line.empty())
+            {
+                continue;
+            }
+
+            std::istringstream iss(line);
+            PlacedCube cube;
+            int glowing = 0;
+            int transparent = 0;
+            iss >> cube.gridX >> cube.gridY >> cube.gridZ >> cube.r >> cube.g >> cube.b >> glowing >> transparent >> cube.presetIndex;
+            if (!iss)
+            {
+                continue;
+            }
+            cube.glowing = glowing != 0;
+            cube.transparent = transparent != 0;
+            if (!(iss >> std::quoted(cube.texturePath)))
+            {
+                cube.texturePath.clear();
+            }
+            if (!cube.texturePath.empty())
+            {
+                const std::string absolute = MakeAbsoluteTexturePath(cube.texturePath);
+                std::string loadStatus;
+                const int handle = LoadTextureFromFile(absolute, loadStatus);
+                cube.textureHandle = handle >= 0 ? handle : kInvalidTextureHandle;
+            }
+            else
+            {
+                cube.textureHandle = kInvalidTextureHandle;
+            }
+            g_placedCubes.push_back(std::move(cube));
+        }
+
+        g_sceneSuppressSave = false;
+        g_sceneDirty = false;
     }
 
     void EnsureSnowflakes(int renderWidth, int renderHeight)
@@ -1981,6 +2183,9 @@ namespace
             case 'F':
                 g_cameraPitchTarget = std::max(g_cameraPitchTarget - kCameraPitchStepDegrees, kCameraPitchMinDegrees);
                 return 0;
+            case 'C':
+                g_showContentPanel = !g_showContentPanel;
+                return 0;
             default:
                 break;
             }
@@ -2058,9 +2263,11 @@ namespace
                 int targetZ = 0;
                 if (ComputePlacementTarget(hit, targetX, targetY, targetZ))
                 {
-                    const SpawnPreset preset = GetSelectedPreset();
-                    const int textureHandle = g_presetTextureHandles[std::clamp(g_selectedPresetIndex, 0, static_cast<int>(kSpawnPresetCount) - 1)];
-                    PlaceCube(targetX, targetY, targetZ, preset, textureHandle);
+                    const int presetIndex = std::clamp(g_selectedPresetIndex, 0, static_cast<int>(kSpawnPresetCount) - 1);
+                    const SpawnPreset& preset = kSpawnPresets[presetIndex];
+                    const int textureHandle = g_presetTextureHandles[presetIndex];
+                    const std::string texturePath = (textureHandle >= 0) ? g_presetTexturePaths[presetIndex] : std::string();
+                    PlaceCube(targetX, targetY, targetZ, preset, presetIndex, textureHandle, texturePath);
                     if (CollidesAtPosition(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ}))
                     {
                         float top = HighestSurfaceAt(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ});
@@ -2086,19 +2293,22 @@ namespace
                 int targetZ = 0;
                 if (ComputePlacementTarget(g_pendingDragHit, targetX, targetY, targetZ))
                 {
-                    if (g_pendingPlacementPresetIndex >= 0)
+                    int presetIndex = g_pendingPlacementPresetIndex;
+                    if (presetIndex < 0)
                     {
-                        const int presetIndex = std::clamp(g_pendingPlacementPresetIndex, 0, static_cast<int>(kSpawnPresetCount) - 1);
-                        const SpawnPreset& preset = kSpawnPresets[presetIndex];
-                        const int textureHandle = g_presetTextureHandles[presetIndex];
-                        PlaceCube(targetX, targetY, targetZ, preset, textureHandle);
-                        if (CollidesAtPosition(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ}))
-                        {
-                            float top = HighestSurfaceAt(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ});
-                            g_game.cubeY = top;
-                            g_game.cubeVelocity = 0.0f;
-                            g_game.grounded = true;
-                        }
+                        presetIndex = g_selectedPresetIndex;
+                    }
+                    presetIndex = std::clamp(presetIndex, 0, static_cast<int>(kSpawnPresetCount) - 1);
+                    const SpawnPreset& preset = kSpawnPresets[presetIndex];
+                    const int textureHandle = g_presetTextureHandles[presetIndex];
+                    const std::string texturePath = (textureHandle >= 0) ? g_presetTexturePaths[presetIndex] : std::string();
+                    PlaceCube(targetX, targetY, targetZ, preset, presetIndex, textureHandle, texturePath);
+                    if (CollidesAtPosition(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ}))
+                    {
+                        float top = HighestSurfaceAt(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ});
+                        g_game.cubeY = top;
+                        g_game.cubeVelocity = 0.0f;
+                        g_game.grounded = true;
                     }
                 }
                 CancelPendingCubeDrag();
@@ -2225,7 +2435,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     HWND hwnd = CreateWindowEx(
         0,
         kWindowClass,
-        "Jumping Cube",
+        "GYGE",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -2244,6 +2454,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
     g_notesFilePath = BuildNotesFilePath();
     LoadNotesFromFile();
+    g_sceneFilePath = BuildSceneFilePath();
+    LoadSceneFromFile();
     g_notesPanelTargetVisible = true;
     g_notesPanelPosX = kNotesPanelMargin;
     g_contentPanelPosY = static_cast<float>(g_windowHeight) + kContentPanelHeight;
@@ -2541,23 +2753,38 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGui::SameLine();
                     ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "glass");
                 }
+                ImGui::NewLine();
                 ImGui::Indent();
+                ImGui::PushItemWidth(240.0f);
                 ImGui::InputTextWithHint("##TexturePath", "texture.png", &g_presetTexturePaths[i]);
+                ImGui::PopItemWidth();
                 ImGui::SameLine();
                 if (ImGui::Button("Load PNG"))
                 {
-                    std::string status;
-                    const int handle = LoadTextureFromFile(g_presetTexturePaths[i], status);
-                    if (handle >= 0)
+                    std::string relative;
+                    std::string normalizeStatus;
+                    if (NormalizeTextureInputPath(g_presetTexturePaths[i], relative, normalizeStatus))
                     {
-                        g_presetTextureHandles[i] = handle;
+                        const std::string absolute = MakeAbsoluteTexturePath(relative);
+                        std::string loadStatus;
+                        const int handle = LoadTextureFromFile(absolute, loadStatus);
+                        if (handle >= 0)
+                        {
+                            g_presetTextureHandles[i] = handle;
+                            g_presetTexturePaths[i] = relative;
+                        }
+                        g_presetTextureStatus[i] = loadStatus;
                     }
-                    g_presetTextureStatus[i] = status;
+                    else
+                    {
+                        g_presetTextureStatus[i] = normalizeStatus;
+                    }
                 }
                 ImGui::SameLine();
                 if (g_presetTextureHandles[i] >= 0 && ImGui::Button("Clear"))
                 {
                     g_presetTextureHandles[i] = kInvalidTextureHandle;
+                    g_presetTexturePaths[i].clear();
                     g_presetTextureStatus[i].clear();
                 }
                 if (!g_presetTextureStatus[i].empty())
@@ -2574,6 +2801,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     }
                 }
                 ImGui::Unindent();
+                ImGui::Spacing();
+                ImGui::Separator();
                 ImGui::PopID();
             }
 
@@ -2647,6 +2876,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     if (g_notesDirty)
     {
         SaveNotesToFile();
+    }
+    if (g_sceneDirty)
+    {
+        SaveSceneToFile();
     }
 
     CleanupLoadedTextures();
