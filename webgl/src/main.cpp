@@ -200,6 +200,7 @@ namespace
         float g;
         float b;
         bool glowing = false;
+        bool transparent = false;
     };
 
     struct SpawnPreset
@@ -209,13 +210,15 @@ namespace
         float g;
         float b;
         bool glowing;
+        bool transparent;
     };
 
     constexpr SpawnPreset kSpawnPresets[] = {
-        {"Blue Cube", 0.30f, 0.45f, 0.85f, false},
-        {"Red Cube", 0.85f, 0.35f, 0.35f, false},
-        {"Grey Cube", 0.65f, 0.65f, 0.65f, false},
-        {"Glow Cube", 1.0f, 0.92f, 0.50f, true},
+        {"Blue Cube", 0.30f, 0.45f, 0.85f, false, false},
+        {"Red Cube", 0.85f, 0.35f, 0.35f, false, false},
+        {"Grey Cube", 0.65f, 0.65f, 0.65f, false, false},
+        {"Glow Cube", 1.0f, 0.92f, 0.50f, true, false},
+        {"Glass Cube", 0.75f, 0.90f, 1.0f, false, true},
     };
     constexpr int kMaxRaytraceCubes = 64;
 
@@ -259,7 +262,7 @@ namespace
             "Overlays:\n"
             "  Code     - edit lua scripts (auto indent, 4 spaces)\n"
             "  Docs     - read-only documentation (copy button)\n"
-            "  Content  - choose cube presets (Glow Cube emits light)\n"
+            "  Content  - choose cube presets (Glow Cube emits light, Glass Cube lets it through)\n"
             "  Compile  - raytraced preview of lighting\n";
 
         bool showDocs = false;
@@ -298,6 +301,7 @@ namespace
         GLint raytraceLocCubeData = -1;
         GLint raytraceLocCubeColor = -1;
         GLint raytraceLocCubeGlow = -1;
+        GLint raytraceLocCubeTransparent = -1;
 
         Mat4 projection{};
         Mat4 view{};
@@ -479,12 +483,13 @@ namespace
             "precision mediump float;\n"
             "in vec3 vNormal;\n"
             "uniform vec3 uColor;\n"
+            "uniform float uAlpha;\n"
             "out vec4 FragColor;\n"
             "void main() {\n"
             "    vec3 lightDir = normalize(vec3(0.4, 0.8, 0.6));\n"
             "    float diff = max(dot(normalize(vNormal), lightDir), 0.15);\n"
             "    vec3 color = uColor * diff;\n"
-            "    FragColor = vec4(color, 1.0);\n"
+            "    FragColor = vec4(color, uAlpha);\n"
             "}\n";
 
         GLuint vs = CompileShader(GL_VERTEX_SHADER, vsSource);
@@ -734,6 +739,7 @@ namespace
                 "uniform vec4 uCubeData[MAX_RAYTRACE_CUBES];\n"
                 "uniform vec4 uCubeColor[MAX_RAYTRACE_CUBES];\n"
                 "uniform int uCubeGlow[MAX_RAYTRACE_CUBES];\n"
+                "uniform int uCubeTransparent[MAX_RAYTRACE_CUBES];\n"
                 "out vec4 FragColor;\n"
                 "\n"
                 "bool IntersectCube(vec3 ro, vec3 rd, vec3 center, out float tHit, out vec3 normal)\n"
@@ -769,6 +775,8 @@ namespace
                 "    {\n"
                 "        if (i == ignoreIndex)\n"
                 "            continue;\n"
+                "        if (uCubeTransparent[i] == 1)\n"
+                "            continue;\n"
                 "        if (IntersectCube(origin, dir, uCubeData[i].xyz, tTmp, nTmp))\n"
                 "        {\n"
                 "            if (tTmp > 0.02 && tTmp < maxT - 0.02)\n"
@@ -800,6 +808,10 @@ namespace
                 "        {\n"
                 "            result += uCubeColor[i].rgb * 0.8;\n"
                 "        }\n"
+                "    }\n"
+                "    if (selfIndex >= 0 && uCubeTransparent[selfIndex] == 1)\n"
+                "    {\n"
+                "        result = mix(result, vec3(0.9, 0.95, 1.0), 0.5);\n"
                 "    }\n"
                 "    return clamp(result, 0.0, 1.0);\n"
                 "}\n"
@@ -897,6 +909,7 @@ namespace
                 app.raytraceLocCubeData = glGetUniformLocation(app.raytraceProgram, "uCubeData");
                 app.raytraceLocCubeColor = glGetUniformLocation(app.raytraceProgram, "uCubeColor");
                 app.raytraceLocCubeGlow = glGetUniformLocation(app.raytraceProgram, "uCubeGlow");
+                app.raytraceLocCubeTransparent = glGetUniformLocation(app.raytraceProgram, "uCubeTransparent");
             }
         }
     }
@@ -912,6 +925,7 @@ namespace
         std::array<float, kMaxRaytraceCubes * 4> cubeData{};
         std::array<float, kMaxRaytraceCubes * 4> cubeColors{};
         std::array<int, kMaxRaytraceCubes> cubeGlow{};
+        std::array<int, kMaxRaytraceCubes> cubeTransparent{};
 
         int cubeCount = 0;
         for (const PlacedCube& cube : app.cubes)
@@ -932,6 +946,7 @@ namespace
             cubeColors[index + 3] = 1.0f;
 
             cubeGlow[cubeCount] = cube.glowing ? 1 : 0;
+            cubeTransparent[cubeCount] = cube.transparent ? 1 : 0;
             ++cubeCount;
         }
 
@@ -986,6 +1001,10 @@ namespace
             if (app.raytraceLocCubeGlow >= 0)
             {
                 glUniform1iv(app.raytraceLocCubeGlow, cubeCount, cubeGlow.data());
+            }
+            if (app.raytraceLocCubeTransparent >= 0)
+            {
+                glUniform1iv(app.raytraceLocCubeTransparent, cubeCount, cubeTransparent.data());
             }
         }
 
@@ -1074,7 +1093,7 @@ namespace
                         const SpawnPreset preset = GetPreset(app.selectedPreset);
                         if (it == app.cubes.end())
                         {
-                            app.cubes.push_back({gridX, gridZ, preset.r, preset.g, preset.b, preset.glowing});
+                            app.cubes.push_back({gridX, gridZ, preset.r, preset.g, preset.b, preset.glowing, preset.transparent});
                         }
                         else
                         {
@@ -1082,6 +1101,7 @@ namespace
                             it->g = preset.g;
                             it->b = preset.b;
                             it->glowing = preset.glowing;
+                            it->transparent = preset.transparent;
                         }
                     }
                     else if (event.button.button == SDL_BUTTON_RIGHT)
@@ -1166,8 +1186,9 @@ namespace
         GLint litMvpLoc = glGetUniformLocation(app.litProgram, "uMVP");
         GLint litModelLoc = glGetUniformLocation(app.litProgram, "uModel");
         GLint litColorLoc = glGetUniformLocation(app.litProgram, "uColor");
+        GLint litAlphaLoc = glGetUniformLocation(app.litProgram, "uAlpha");
 
-        auto renderCubeAt = [&](float x, float y, float z, const Vec3& color) {
+        auto renderCubeAt = [&](float x, float y, float z, const Vec3& color, float alpha) {
             Mat4 model = Mat4::Identity();
             model.m[12] = x;
             model.m[13] = y;
@@ -1176,17 +1197,45 @@ namespace
             glUniformMatrix4fv(litMvpLoc, 1, GL_FALSE, mvp.m);
             glUniformMatrix4fv(litModelLoc, 1, GL_FALSE, model.m);
             glUniform3f(litColorLoc, color.x, color.y, color.z);
+            if (litAlphaLoc >= 0)
+            {
+                glUniform1f(litAlphaLoc, alpha);
+            }
             glBindVertexArray(app.cubeVao);
             glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
             glBindVertexArray(0);
         };
 
+        std::vector<const PlacedCube*> transparentCubes;
+
         for (const PlacedCube& cube : app.cubes)
         {
-            renderCubeAt(static_cast<float>(cube.gridX), 0.5f, static_cast<float>(cube.gridZ), Vec3{cube.r, cube.g, cube.b});
+            if (cube.transparent)
+            {
+                transparentCubes.push_back(&cube);
+                continue;
+            }
+            renderCubeAt(static_cast<float>(cube.gridX), 0.5f, static_cast<float>(cube.gridZ), Vec3{cube.r, cube.g, cube.b}, 1.0f);
         }
 
-        renderCubeAt(app.cameraFocus.x, 0.5f, app.cameraFocus.z, Vec3{0.6f, 0.7f, 1.0f});
+        if (!transparentCubes.empty())
+        {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            for (const PlacedCube* cube : transparentCubes)
+            {
+                renderCubeAt(static_cast<float>(cube->gridX), 0.5f, static_cast<float>(cube->gridZ), Vec3{cube->r, cube->g, cube->b}, 0.45f);
+            }
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            if (litAlphaLoc >= 0)
+            {
+                glUniform1f(litAlphaLoc, 1.0f);
+            }
+        }
+
+        renderCubeAt(app.cameraFocus.x, 0.5f, app.cameraFocus.z, Vec3{0.6f, 0.7f, 1.0f}, 1.0f);
 
         RenderGlowEffects(app, vp);
     }
@@ -1523,6 +1572,11 @@ namespace
                 {
                     ImGui::SameLine();
                     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "glow");
+                }
+                if (preset.transparent)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "glass");
                 }
                 ImGui::PopID();
             }

@@ -1,8 +1,10 @@
 #include <windows.h>
 #include <windowsx.h>
+#include <gdiplus.h>
 #include <GL/gl.h>
 #include <GL/glu.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -14,6 +16,10 @@
 #include <cstring>
 #include <cctype>
 
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_opengl2.h"
@@ -23,10 +29,213 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace
 {
+    constexpr int kInvalidTextureHandle = -1;
+
+    ULONG_PTR g_gdiplusToken = 0;
+
+    bool EnsureGdiplusInitialized()
+    {
+        if (g_gdiplusToken != 0)
+        {
+            return true;
+        }
+
+        Gdiplus::GdiplusStartupInput input;
+        return Gdiplus::GdiplusStartup(&g_gdiplusToken, &input, nullptr) == Gdiplus::Ok;
+    }
+
+    void ShutdownGdiplus()
+    {
+        if (g_gdiplusToken != 0)
+        {
+            Gdiplus::GdiplusShutdown(g_gdiplusToken);
+            g_gdiplusToken = 0;
+        }
+    }
+
+    std::wstring Utf8ToWide(const std::string& input)
+    {
+        if (input.empty())
+        {
+            return std::wstring();
+        }
+        const int required = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, nullptr, 0);
+        if (required <= 0)
+        {
+            return std::wstring();
+        }
+        std::wstring result(static_cast<size_t>(required) - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, result.data(), required);
+        return result;
+    }
+
+    bool LoadImagePixelsGdiplus(const std::string& path, std::vector<unsigned char>& outPixels, UINT& width, UINT& height, std::string& errorMessage)
+    {
+        if (!EnsureGdiplusInitialized())
+        {
+            errorMessage = "Failed to initialize GDI+";
+            return false;
+        }
+
+        std::wstring widePath = Utf8ToWide(path);
+        if (widePath.empty())
+        {
+            errorMessage = "Invalid path";
+            return false;
+        }
+
+        Gdiplus::Bitmap bitmap(widePath.c_str());
+        if (bitmap.GetLastStatus() != Gdiplus::Ok)
+        {
+            errorMessage = "Unable to open image";
+            return false;
+        }
+
+        width = bitmap.GetWidth();
+        height = bitmap.GetHeight();
+        if (width == 0 || height == 0)
+        {
+            errorMessage = "Image has no size";
+            return false;
+        }
+
+        Gdiplus::Rect rect(0, 0, width, height);
+        Gdiplus::BitmapData data;
+        if (bitmap.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok)
+        {
+            errorMessage = "LockBits failed";
+            return false;
+        }
+
+        outPixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+        for (UINT y = 0; y < height; ++y)
+        {
+            const unsigned char* srcRow = static_cast<const unsigned char*>(data.Scan0) + y * data.Stride;
+            for (UINT x = 0; x < width; ++x)
+            {
+                const size_t dstIndex = (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4u;
+                const unsigned char b = srcRow[x * 4 + 0];
+                const unsigned char g = srcRow[x * 4 + 1];
+                const unsigned char r = srcRow[x * 4 + 2];
+                const unsigned char a = srcRow[x * 4 + 3];
+                outPixels[dstIndex + 0] = r;
+                outPixels[dstIndex + 1] = g;
+                outPixels[dstIndex + 2] = b;
+                outPixels[dstIndex + 3] = a;
+            }
+        }
+
+        bitmap.UnlockBits(&data);
+        return true;
+    }
+
+    struct LoadedTexture
+    {
+        GLuint id = 0;
+        int width = 0;
+        int height = 0;
+        std::string path;
+    };
+
+    std::vector<LoadedTexture> g_loadedTextures;
+
+    const LoadedTexture* GetTextureInfo(int handle)
+    {
+        if (handle < 0 || static_cast<size_t>(handle) >= g_loadedTextures.size())
+        {
+            return nullptr;
+        }
+        return &g_loadedTextures[static_cast<size_t>(handle)];
+    }
+
+    int FindTextureHandleByPath(const std::string& path)
+    {
+        for (size_t i = 0; i < g_loadedTextures.size(); ++i)
+        {
+            if (g_loadedTextures[i].path == path)
+            {
+                return static_cast<int>(i);
+            }
+        }
+        return kInvalidTextureHandle;
+    }
+
+    int LoadTextureFromFile(const std::string& path, std::string& messageOut)
+    {
+        if (path.empty())
+        {
+            messageOut = "Path is empty";
+            return kInvalidTextureHandle;
+        }
+
+        const int existing = FindTextureHandleByPath(path);
+        if (existing >= 0)
+        {
+            messageOut = "Texture cached";
+            return existing;
+        }
+
+        std::vector<unsigned char> pixels;
+        UINT width = 0;
+        UINT height = 0;
+        if (!LoadImagePixelsGdiplus(path, pixels, width, height, messageOut))
+        {
+            return kInvalidTextureHandle;
+        }
+
+        GLuint texId = 0;
+        glGenTextures(1, &texId);
+        if (texId == 0)
+        {
+            messageOut = "glGenTextures failed";
+            return kInvalidTextureHandle;
+        }
+
+        glBindTexture(GL_TEXTURE_2D, texId);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D,
+                     0,
+                     GL_RGBA8,
+                     static_cast<GLsizei>(width),
+                     static_cast<GLsizei>(height),
+                     0,
+                     GL_RGBA,
+                     GL_UNSIGNED_BYTE,
+                     pixels.data());
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        LoadedTexture info;
+        info.id = texId;
+        info.width = static_cast<int>(width);
+        info.height = static_cast<int>(height);
+        info.path = path;
+        g_loadedTextures.push_back(info);
+
+        messageOut = "Loaded";
+        return static_cast<int>(g_loadedTextures.size() - 1);
+    }
+
+    void CleanupLoadedTextures()
+    {
+        for (LoadedTexture& tex : g_loadedTextures)
+        {
+            if (tex.id != 0)
+            {
+                glDeleteTextures(1, &tex.id);
+                tex.id = 0;
+            }
+        }
+        g_loadedTextures.clear();
+    }
+
     struct Mesh
     {
         std::vector<float> vertices; // xyz triplets
         std::vector<float> normals;  // xyz triplets
+        std::vector<float> texcoords; // uv pairs
     };
 
     struct PlacedCube
@@ -38,6 +247,8 @@ namespace
         float g;
         float b;
         bool glowing = false;
+        bool transparent = false;
+        int textureHandle = kInvalidTextureHandle;
     };
 
     struct GameState
@@ -118,12 +329,16 @@ namespace
         "  Use Save button to persist notes.txt\n\n"
         "Content Panel:\n"
         "  Toggle 'Content' to pick cube presets for spawning\n"
-        "  Glow Cube emits light and casts shadows around the grid\n\n"
+        "  Glow Cube emits light and casts shadows around the grid\n"
+        "  Glass Cube blocks movement but lets light shine through\n"
+        "  Use Load PNG to apply a texture to new cubes\n\n"
         "Environment Panel:\n"
         "  Adjust sky gradient colors in real time\n";
 
     float g_cameraYawDegrees = 0.0f;
     float g_cameraYawTarget = 0.0f;
+    float g_cameraPitchDegrees = 65.0f;
+    float g_cameraPitchTarget = 65.0f;
     bool g_moveForward = false;
     bool g_moveBackward = false;
     bool g_moveLeft = false;
@@ -135,7 +350,10 @@ namespace
     constexpr float kCameraMaxDistance = 18.0f;
     constexpr float kCameraMoveSpeed = 6.0f;
     constexpr float kCameraZoomStep = 0.6f;
-    constexpr float kCameraPitchDegrees = 65.0f;
+    constexpr float kCameraPitchMinDegrees = 25.0f;
+    constexpr float kCameraPitchMaxDegrees = 85.0f;
+    constexpr float kCameraPitchStepDegrees = 6.0f;
+    constexpr float kCameraPitchSpeed = 180.0f;
     constexpr float kCameraRotationSpeed = 240.0f;
     std::vector<PlacedCube> g_placedCubes;
     bool g_showContentPanel = false;
@@ -148,6 +366,20 @@ namespace
     constexpr float kPlayerRadius = 0.35f;
     constexpr float kPlayerHeight = 1.0f;
     constexpr float kStepHeight = 1.0f;
+    bool g_draggingCube = false;
+    PlacedCube g_draggedCube;
+    bool g_dragPreviewValid = false;
+    bool g_dragPreviewHasPosition = false;
+    int g_dragPreviewX = 0;
+    int g_dragPreviewY = 0;
+    int g_dragPreviewZ = 0;
+    bool g_pendingCubeDrag = false;
+    int g_pendingDragIndex = -1;
+    int g_pendingPlacementPresetIndex = -1;
+    POINT g_pendingDragStartPos{0, 0};
+    double g_pendingDragStartTime = 0.0;
+    constexpr int kDragStartPixelThreshold = 4;
+    constexpr double kDragStartHoldSeconds = 0.12;
 
     Vec3 CameraForward2D()
     {
@@ -194,15 +426,17 @@ namespace
         float g;
         float b;
         bool glowing;
+        bool transparent;
     };
 
-    float ComputeLightAtPoint(const Vec3& point, const PlacedCube* receiver = nullptr);
+    float ComputeLightAtPoint(const Vec3& point, const PlacedCube* receiver);
 
     constexpr SpawnPreset kSpawnPresets[] = {
-        {"Blue Cube", 0.3f, 0.45f, 0.85f, false},
-        {"Red Cube", 0.85f, 0.35f, 0.35f, false},
-        {"Grey Cube", 0.65f, 0.65f, 0.65f, false},
-        {"Glow Cube", 1.0f, 0.92f, 0.5f, true},
+        {"Blue Cube", 0.3f, 0.45f, 0.85f, false, false},
+        {"Red Cube", 0.85f, 0.35f, 0.35f, false, false},
+        {"Grey Cube", 0.65f, 0.65f, 0.65f, false, false},
+        {"Glow Cube", 1.0f, 0.92f, 0.5f, true, false},
+        {"Glass Cube", 0.75f, 0.9f, 1.0f, false, true},
     };
     int g_selectedPresetIndex = 2;
 
@@ -211,6 +445,17 @@ namespace
         const int clamped = std::clamp(g_selectedPresetIndex, 0, static_cast<int>(std::size(kSpawnPresets)) - 1);
         return kSpawnPresets[clamped];
     }
+
+    constexpr size_t kSpawnPresetCount = std::size(kSpawnPresets);
+
+    std::array<int, kSpawnPresetCount> g_presetTextureHandles = [] {
+        std::array<int, kSpawnPresetCount> handles{};
+        handles.fill(kInvalidTextureHandle);
+        return handles;
+    }();
+
+    std::array<std::string, kSpawnPresetCount> g_presetTexturePaths;
+    std::array<std::string, kSpawnPresetCount> g_presetTextureStatus;
 
     int FindCubeIndex(int x, int y, int z)
     {
@@ -241,7 +486,7 @@ namespace
         return bestIndex;
     }
 
-    void PlaceCube(int x, int y, int z, const SpawnPreset& preset)
+    void PlaceCube(int x, int y, int z, const SpawnPreset& preset, int textureHandle)
     {
         if (std::abs(x) > 100 || std::abs(z) > 100)
         {
@@ -251,7 +496,7 @@ namespace
         {
             return;
         }
-        g_placedCubes.push_back({x, y, z, preset.r, preset.g, preset.b, preset.glowing});
+        g_placedCubes.push_back({x, y, z, preset.r, preset.g, preset.b, preset.glowing, preset.transparent, textureHandle});
     }
 
     void RemoveCube(int x, int y, int z)
@@ -387,6 +632,156 @@ namespace
         }
 
         return result;
+    }
+
+    RayHit g_pendingDragHit;
+
+    bool ComputePlacementTarget(const RayHit& hit, int& outX, int& outY, int& outZ)
+    {
+        if (!hit.hit)
+        {
+            return false;
+        }
+        if (hit.hitCube)
+        {
+            const int offsetX = static_cast<int>(std::round(hit.normal.x));
+            const int offsetY = static_cast<int>(std::round(hit.normal.y));
+            const int offsetZ = static_cast<int>(std::round(hit.normal.z));
+            outX = hit.cubeX + offsetX;
+            outY = hit.cubeY + offsetY;
+            outZ = hit.cubeZ + offsetZ;
+            return true;
+        }
+        if (hit.hitGround)
+        {
+            outX = hit.groundX;
+            outZ = hit.groundZ;
+            int topIndex = FindHighestCubeIndex(outX, outZ);
+            if (topIndex >= 0)
+            {
+                outY = g_placedCubes[topIndex].gridY + 1;
+            }
+            else
+            {
+                outY = -1;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool ComputeRayFromScreen(int mouseX, int mouseY, Vec3& origin, Vec3& direction)
+    {
+        GLint viewport[4];
+        GLdouble modelview[16];
+        GLdouble projection[16];
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        glGetDoublev(GL_MODELVIEW_MATRIX, modelview);
+        glGetDoublev(GL_PROJECTION_MATRIX, projection);
+
+        const double winX = static_cast<double>(mouseX);
+        const double winY = static_cast<double>(viewport[3] - mouseY);
+        GLdouble nearX, nearY, nearZ;
+        GLdouble farX, farY, farZ;
+        if (gluUnProject(winX, winY, 0.0, modelview, projection, viewport, &nearX, &nearY, &nearZ) == GL_FALSE)
+        {
+            return false;
+        }
+        if (gluUnProject(winX, winY, 1.0, modelview, projection, viewport, &farX, &farY, &farZ) == GL_FALSE)
+        {
+            return false;
+        }
+
+        origin = Vec3{static_cast<float>(nearX), static_cast<float>(nearY), static_cast<float>(nearZ)};
+        direction = Vec3{static_cast<float>(farX - nearX), static_cast<float>(farY - nearY), static_cast<float>(farZ - nearZ)};
+        return true;
+    }
+
+    void UpdateDraggingCubePreview(int mouseX, int mouseY)
+    {
+        if (!g_draggingCube)
+        {
+            return;
+        }
+        Vec3 origin;
+        Vec3 direction;
+        if (!ComputeRayFromScreen(mouseX, mouseY, origin, direction))
+        {
+            g_dragPreviewHasPosition = false;
+            g_dragPreviewValid = false;
+            return;
+        }
+        RayHit hit = CastWorldRay(origin, direction);
+        int targetX = 0;
+        int targetY = 0;
+        int targetZ = 0;
+        if (!ComputePlacementTarget(hit, targetX, targetY, targetZ))
+        {
+            g_dragPreviewHasPosition = false;
+            g_dragPreviewValid = false;
+            return;
+        }
+
+        g_dragPreviewX = targetX;
+        g_dragPreviewY = targetY;
+        g_dragPreviewZ = targetZ;
+        g_dragPreviewHasPosition = true;
+
+        if (std::abs(targetX) > 100 || std::abs(targetZ) > 100)
+        {
+            g_dragPreviewValid = false;
+            return;
+        }
+        if (FindCubeIndex(targetX, targetY, targetZ) >= 0)
+        {
+            g_dragPreviewValid = false;
+            return;
+        }
+        g_dragPreviewValid = true;
+    }
+
+    void CancelPendingCubeDrag()
+    {
+        g_pendingCubeDrag = false;
+        g_pendingDragIndex = -1;
+        g_pendingPlacementPresetIndex = -1;
+    }
+
+    void BeginCubeDrag(int cubeIndex, int mouseX, int mouseY)
+    {
+        if (cubeIndex < 0 || cubeIndex >= static_cast<int>(g_placedCubes.size()))
+        {
+            CancelPendingCubeDrag();
+            return;
+        }
+        g_draggingCube = true;
+        g_draggedCube = g_placedCubes[cubeIndex];
+        g_placedCubes.erase(g_placedCubes.begin() + cubeIndex);
+        g_dragPreviewHasPosition = false;
+        g_dragPreviewValid = false;
+        UpdateDraggingCubePreview(mouseX, mouseY);
+        g_pendingPlacementPresetIndex = -1;
+    }
+
+    void FinishCubeDrag(bool commit)
+    {
+        if (!g_draggingCube)
+        {
+            return;
+        }
+        if (commit && g_dragPreviewValid && g_dragPreviewHasPosition)
+        {
+            g_draggedCube.gridX = g_dragPreviewX;
+            g_draggedCube.gridY = g_dragPreviewY;
+            g_draggedCube.gridZ = g_dragPreviewZ;
+        }
+        g_placedCubes.push_back(g_draggedCube);
+        g_draggingCube = false;
+        g_dragPreviewValid = false;
+        g_dragPreviewHasPosition = false;
+        g_draggedCube = {};
+        ReleaseCapture();
+        g_pendingPlacementPresetIndex = -1;
     }
 
     const std::unordered_set<std::string> kLuaKeywords = {
@@ -722,58 +1117,67 @@ namespace
             float nx;
             float ny;
             float nz;
+            float u;
+            float v;
         };
 
         constexpr float s = 0.5f;
 
         constexpr VertexData vertices[] = {
-            {-s, -s, s, 0.0f, 0.0f, 1.0f},
-            {s, -s, s, 0.0f, 0.0f, 1.0f},
-            {s, s, s, 0.0f, 0.0f, 1.0f},
-            {-s, -s, s, 0.0f, 0.0f, 1.0f},
-            {s, s, s, 0.0f, 0.0f, 1.0f},
-            {-s, s, s, 0.0f, 0.0f, 1.0f},
+            // Front
+            {-s, -s, s, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+            {s, -s, s, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f},
+            {s, s, s, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+            {-s, -s, s, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+            {s, s, s, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f},
+            {-s, s, s, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f},
 
-            {s, -s, s, 1.0f, 0.0f, 0.0f},
-            {s, -s, -s, 1.0f, 0.0f, 0.0f},
-            {s, s, -s, 1.0f, 0.0f, 0.0f},
-            {s, -s, s, 1.0f, 0.0f, 0.0f},
-            {s, s, -s, 1.0f, 0.0f, 0.0f},
-            {s, s, s, 1.0f, 0.0f, 0.0f},
+            // Right
+            {s, -s, s, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+            {s, -s, -s, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f},
+            {s, s, -s, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+            {s, -s, s, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+            {s, s, -s, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+            {s, s, s, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f},
 
-            {s, -s, -s, 0.0f, 0.0f, -1.0f},
-            {-s, -s, -s, 0.0f, 0.0f, -1.0f},
-            {-s, s, -s, 0.0f, 0.0f, -1.0f},
-            {s, -s, -s, 0.0f, 0.0f, -1.0f},
-            {-s, s, -s, 0.0f, 0.0f, -1.0f},
-            {s, s, -s, 0.0f, 0.0f, -1.0f},
+            // Back
+            {s, -s, -s, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f},
+            {-s, -s, -s, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f},
+            {-s, s, -s, 0.0f, 0.0f, -1.0f, 0.0f, 1.0f},
+            {s, -s, -s, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f},
+            {-s, s, -s, 0.0f, 0.0f, -1.0f, 0.0f, 1.0f},
+            {s, s, -s, 0.0f, 0.0f, -1.0f, 1.0f, 1.0f},
 
-            {-s, -s, -s, -1.0f, 0.0f, 0.0f},
-            {-s, -s, s, -1.0f, 0.0f, 0.0f},
-            {-s, s, s, -1.0f, 0.0f, 0.0f},
-            {-s, -s, -s, -1.0f, 0.0f, 0.0f},
-            {-s, s, s, -1.0f, 0.0f, 0.0f},
-            {-s, s, -s, -1.0f, 0.0f, 0.0f},
+            // Left
+            {-s, -s, -s, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f},
+            {-s, -s, s, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+            {-s, s, s, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f},
+            {-s, -s, -s, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f},
+            {-s, s, s, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f},
+            {-s, s, -s, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f},
 
-            {-s, s, s, 0.0f, 1.0f, 0.0f},
-            {s, s, s, 0.0f, 1.0f, 0.0f},
-            {s, s, -s, 0.0f, 1.0f, 0.0f},
-            {-s, s, s, 0.0f, 1.0f, 0.0f},
-            {s, s, -s, 0.0f, 1.0f, 0.0f},
-            {-s, s, -s, 0.0f, 1.0f, 0.0f},
+            // Top
+            {-s, s, s, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
+            {s, s, s, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f},
+            {s, s, -s, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+            {-s, s, s, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f},
+            {s, s, -s, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f},
+            {-s, s, -s, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
 
-            {-s, -s, -s, 0.0f, -1.0f, 0.0f},
-            {s, -s, -s, 0.0f, -1.0f, 0.0f},
-            {s, -s, s, 0.0f, -1.0f, 0.0f},
-            {-s, -s, -s, 0.0f, -1.0f, 0.0f},
-            {s, -s, s, 0.0f, -1.0f, 0.0f},
-            {-s, -s, s, 0.0f, -1.0f, 0.0f},
+            // Bottom
+            {-s, -s, -s, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f},
+            {s, -s, -s, 0.0f, -1.0f, 0.0f, 1.0f, 1.0f},
+            {s, -s, s, 0.0f, -1.0f, 0.0f, 1.0f, 0.0f},
+            {-s, -s, -s, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f},
+            {s, -s, s, 0.0f, -1.0f, 0.0f, 1.0f, 0.0f},
+            {-s, -s, s, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f},
         };
 
         Mesh mesh;
         const size_t vertexCount = sizeof(vertices) / sizeof(vertices[0]);
         mesh.vertices.reserve(vertexCount * 3);
         mesh.normals.reserve(vertexCount * 3);
+        mesh.texcoords.reserve(vertexCount * 2);
 
         for (size_t i = 0; i < vertexCount; ++i)
         {
@@ -784,6 +1188,8 @@ namespace
             mesh.normals.push_back(v.nx);
             mesh.normals.push_back(v.ny);
             mesh.normals.push_back(v.nz);
+            mesh.texcoords.push_back(v.u);
+            mesh.texcoords.push_back(v.v);
         }
 
         return mesh;
@@ -845,17 +1251,38 @@ namespace
         glEnable(GL_LIGHTING);
     }
 
-    void RenderMesh(const Mesh& mesh, float r = 0.6f, float g = 0.7f, float b = 1.0f)
+    void RenderMesh(const Mesh& mesh, float r = 0.6f, float g = 0.7f, float b = 1.0f, float a = 1.0f, int textureHandle = kInvalidTextureHandle)
     {
-        glColor3f(r, g, b);
+        const LoadedTexture* texture = GetTextureInfo(textureHandle);
+        const bool textureEnabled = texture && texture->id != 0;
+        if (textureEnabled)
+        {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, texture->id);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        }
+
+        glColor4f(r, g, b, a);
         glBegin(GL_TRIANGLES);
         const size_t count = mesh.vertices.size();
+        const bool hasTexcoords = mesh.texcoords.size() >= (count / 3) * 2;
         for (size_t i = 0; i < count; i += 3)
         {
+            const size_t texIndex = (i / 3) * 2;
+            if (textureEnabled && hasTexcoords && texIndex + 1 < mesh.texcoords.size())
+            {
+                glTexCoord2f(mesh.texcoords[texIndex], mesh.texcoords[texIndex + 1]);
+            }
             glNormal3f(mesh.normals[i], mesh.normals[i + 1], mesh.normals[i + 2]);
             glVertex3f(mesh.vertices[i], mesh.vertices[i + 1], mesh.vertices[i + 2]);
         }
         glEnd();
+
+        if (textureEnabled)
+        {
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glDisable(GL_TEXTURE_2D);
+        }
     }
 
     void RenderGlowAura(const PlacedCube& cube)
@@ -903,6 +1330,126 @@ namespace
         glPopAttrib();
     }
 
+    void RenderTransparentCubes(const Mesh& mesh, const std::vector<const PlacedCube*>& cubes)
+    {
+        if (cubes.empty())
+        {
+            return;
+        }
+
+        glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+
+        constexpr float kAlpha = 0.45f;
+        const GLfloat kNoEmission[] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+        for (const PlacedCube* cube : cubes)
+        {
+            glPushMatrix();
+            glTranslatef(static_cast<float>(cube->gridX), static_cast<float>(cube->gridY) + 0.5f, static_cast<float>(cube->gridZ));
+            Vec3 samplePos{static_cast<float>(cube->gridX), static_cast<float>(cube->gridY) + 0.5f, static_cast<float>(cube->gridZ)};
+            const float lightAmount = cube->glowing ? 1.0f : ComputeLightAtPoint(samplePos, cube);
+            const float shading = std::clamp(0.5f + 0.5f * lightAmount, 0.2f, 1.2f);
+            const float tintedR = std::clamp(cube->r * shading, 0.0f, 1.0f);
+            const float tintedG = std::clamp(cube->g * shading, 0.0f, 1.0f);
+            const float tintedB = std::clamp(cube->b * shading, 0.0f, 1.0f);
+            if (cube->glowing)
+            {
+                const GLfloat emission[] = {cube->r * 0.4f, cube->g * 0.4f, cube->b * 0.4f, 1.0f};
+                glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, emission);
+            }
+            RenderMesh(mesh, tintedR, tintedG, tintedB, kAlpha, cube->textureHandle);
+            if (cube->glowing)
+            {
+                glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, kNoEmission);
+            }
+            glPopMatrix();
+        }
+
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glPopAttrib();
+
+        for (const PlacedCube* cube : cubes)
+        {
+            if (cube->glowing)
+            {
+                RenderGlowAura(*cube);
+            }
+        }
+    }
+
+    void RenderDraggingCubePreview(const Mesh& mesh)
+    {
+        if (!g_draggingCube)
+        {
+            return;
+        }
+
+        int drawX = g_dragPreviewHasPosition ? g_dragPreviewX : g_draggedCube.gridX;
+        int drawY = g_dragPreviewHasPosition ? g_dragPreviewY : g_draggedCube.gridY;
+        int drawZ = g_dragPreviewHasPosition ? g_dragPreviewZ : g_draggedCube.gridZ;
+
+        Vec3 samplePos{static_cast<float>(drawX), static_cast<float>(drawY) + 0.5f, static_cast<float>(drawZ)};
+        const float lightAmount = g_draggedCube.glowing ? 1.0f : ComputeLightAtPoint(samplePos, &g_draggedCube);
+        const float shading = std::clamp(0.4f + 0.6f * lightAmount, 0.2f, 1.0f);
+        const float shadedR = std::clamp(g_draggedCube.r * shading, 0.0f, 1.0f);
+        const float shadedG = std::clamp(g_draggedCube.g * shading, 0.0f, 1.0f);
+        const float shadedB = std::clamp(g_draggedCube.b * shading, 0.0f, 1.0f);
+        const float alpha = g_draggedCube.transparent ? 0.45f : 1.0f;
+
+        glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_POLYGON_BIT);
+        if (g_draggedCube.transparent)
+        {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+        }
+        glPushMatrix();
+        glTranslatef(static_cast<float>(drawX), static_cast<float>(drawY) + 0.5f, static_cast<float>(drawZ));
+        const GLfloat kNoEmission[] = {0.0f, 0.0f, 0.0f, 1.0f};
+        if (g_draggedCube.glowing)
+        {
+            const GLfloat emission[] = {g_draggedCube.r * 0.6f, g_draggedCube.g * 0.6f, g_draggedCube.b * 0.6f, 1.0f};
+            glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, emission);
+        }
+        RenderMesh(mesh, shadedR, shadedG, shadedB, alpha, g_draggedCube.textureHandle);
+        if (g_draggedCube.glowing)
+        {
+            glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, kNoEmission);
+        }
+        glPopMatrix();
+        if (g_draggedCube.transparent)
+        {
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        glDisable(GL_LIGHTING);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+        glLineWidth(2.0f);
+        const float highlightIntensity = g_dragPreviewValid ? 1.0f : 0.5f;
+        glColor3f(0.8f * highlightIntensity, 0.45f * highlightIntensity, 1.0f * highlightIntensity);
+        glPushMatrix();
+        glTranslatef(static_cast<float>(drawX), static_cast<float>(drawY) + 0.5f, static_cast<float>(drawZ));
+        RenderMesh(mesh);
+        glPopMatrix();
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glEnable(GL_LIGHTING);
+        glPopAttrib();
+
+        if (g_draggedCube.glowing && g_dragPreviewHasPosition)
+        {
+            PlacedCube previewGlow = g_draggedCube;
+            previewGlow.gridX = drawX;
+            previewGlow.gridY = drawY;
+            previewGlow.gridZ = drawZ;
+            RenderGlowAura(previewGlow);
+        }
+    }
+
     bool IsLightOccluded(const Vec3& origin, const Vec3& target, const PlacedCube* lightCube, const PlacedCube* receiver)
     {
         Vec3 dir = target - origin;
@@ -915,6 +1462,10 @@ namespace
         for (const PlacedCube& cube : g_placedCubes)
         {
             if (&cube == lightCube || &cube == receiver)
+            {
+                continue;
+            }
+            if (cube.transparent)
             {
                 continue;
             }
@@ -983,8 +1534,14 @@ namespace
     void RenderPlacedCubes(const Mesh& mesh)
     {
         const GLfloat kNoEmission[] = {0.0f, 0.0f, 0.0f, 1.0f};
+        std::vector<const PlacedCube*> transparentCubes;
         for (const PlacedCube& cube : g_placedCubes)
         {
+            if (cube.transparent)
+            {
+                transparentCubes.push_back(&cube);
+                continue;
+            }
             glPushMatrix();
             glTranslatef(static_cast<float>(cube.gridX), static_cast<float>(cube.gridY) + 0.5f, static_cast<float>(cube.gridZ));
             Vec3 samplePos{static_cast<float>(cube.gridX), static_cast<float>(cube.gridY) + 0.5f, static_cast<float>(cube.gridZ)};
@@ -998,7 +1555,7 @@ namespace
                 const GLfloat emission[] = {cube.r * 0.6f, cube.g * 0.6f, cube.b * 0.6f, 1.0f};
                 glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, emission);
             }
-            RenderMesh(mesh, shadedR, shadedG, shadedB);
+            RenderMesh(mesh, shadedR, shadedG, shadedB, 1.0f, cube.textureHandle);
             if (cube.glowing)
             {
                 glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, kNoEmission);
@@ -1010,6 +1567,13 @@ namespace
                 RenderGlowAura(cube);
             }
         }
+
+        if (!transparentCubes.empty())
+        {
+            RenderTransparentCubes(mesh, transparentCubes);
+        }
+
+        RenderDraggingCubePreview(mesh);
     }
 
     bool OverlapsRange(float minA, float maxA, float minB, float maxB)
@@ -1246,7 +1810,7 @@ namespace
     {
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
-        const float pitchRadians = kCameraPitchDegrees * (kPi / 180.0f);
+        const float pitchRadians = g_cameraPitchDegrees * (kPi / 180.0f);
         const float cameraHeight = std::sin(pitchRadians) * g_cameraDistance;
         const float cameraForward = std::cos(pitchRadians) * g_cameraDistance;
         const float yawRadians = g_cameraYawDegrees * (kPi / 180.0f);
@@ -1273,7 +1837,7 @@ namespace
         glRotatef(g_game.rotation * 0.5f, 1.0f, 0.0f, 0.0f);
         const float playerLight = ComputeLightAtPoint(Vec3{g_game.cubeX, g_game.cubeY + 0.5f, g_game.cubeZ}, nullptr);
         const float playerShade = std::clamp(0.5f + 0.5f * playerLight, 0.3f, 1.0f);
-        RenderMesh(mesh, 0.6f * playerShade, 0.7f * playerShade, 1.0f * playerShade);
+        RenderMesh(mesh, 0.6f * playerShade, 0.7f * playerShade, 1.0f * playerShade, 1.0f, kInvalidTextureHandle);
         glPopMatrix();
     }
 
@@ -1411,9 +1975,15 @@ namespace
                     g_cameraYawTarget += 90.0f;
                     NormalizeAngle(g_cameraYawTarget);
                     return 0;
-                default:
-                    break;
-                }
+            case 'R':
+                g_cameraPitchTarget = std::min(g_cameraPitchTarget + kCameraPitchStepDegrees, kCameraPitchMaxDegrees);
+                return 0;
+            case 'F':
+                g_cameraPitchTarget = std::max(g_cameraPitchTarget - kCameraPitchStepDegrees, kCameraPitchMinDegrees);
+                return 0;
+            default:
+                break;
+            }
             }
             break;
         case WM_KEYUP:
@@ -1447,7 +2017,6 @@ namespace
             return 0;
         }
         case WM_LBUTTONDOWN:
-        case WM_RBUTTONDOWN:
         {
             if (ImGui::GetIO().WantCaptureMouse)
             {
@@ -1456,30 +2025,12 @@ namespace
 
             const int mouseX = GET_X_LPARAM(lParam);
             const int mouseY = GET_Y_LPARAM(lParam);
-
-            GLint viewport[4];
-            GLdouble modelview[16];
-            GLdouble projection[16];
-
-            glGetIntegerv(GL_VIEWPORT, viewport);
-            glGetDoublev(GL_MODELVIEW_MATRIX, modelview);
-            glGetDoublev(GL_PROJECTION_MATRIX, projection);
-
-            const double winX = static_cast<double>(mouseX);
-            const double winY = static_cast<double>(viewport[3] - mouseY);
-            GLdouble nearX, nearY, nearZ;
-            GLdouble farX, farY, farZ;
-            if (gluUnProject(winX, winY, 0.0, modelview, projection, viewport, &nearX, &nearY, &nearZ) == GL_FALSE)
+            Vec3 origin;
+            Vec3 direction;
+            if (!ComputeRayFromScreen(mouseX, mouseY, origin, direction))
             {
                 break;
             }
-            if (gluUnProject(winX, winY, 1.0, modelview, projection, viewport, &farX, &farY, &farZ) == GL_FALSE)
-            {
-                break;
-            }
-
-            Vec3 origin{static_cast<float>(nearX), static_cast<float>(nearY), static_cast<float>(nearZ)};
-            Vec3 direction{static_cast<float>(farX - nearX), static_cast<float>(farY - nearY), static_cast<float>(farZ - nearZ)};
 
             RayHit hit = CastWorldRay(origin, direction);
             if (!hit.hit)
@@ -1487,54 +2038,156 @@ namespace
                 break;
             }
 
-            if (uMsg == WM_LBUTTONDOWN)
+            if (hit.hitCube)
             {
-                const SpawnPreset preset = GetSelectedPreset();
-                if (hit.hitCube)
+                int cubeIndex = FindCubeIndex(hit.cubeX, hit.cubeY, hit.cubeZ);
+                if (cubeIndex >= 0)
                 {
-                    int offsetX = static_cast<int>(std::round(hit.normal.x));
-                    int offsetY = static_cast<int>(std::round(hit.normal.y));
-                    int offsetZ = static_cast<int>(std::round(hit.normal.z));
-                    const int targetX = hit.cubeX + offsetX;
-                    const int targetY = hit.cubeY + offsetY;
-                    const int targetZ = hit.cubeZ + offsetZ;
-                    PlaceCube(targetX, targetY, targetZ, preset);
-                }
-                else if (hit.hitGround)
-                {
-                    int targetX = hit.groundX;
-                    int targetZ = hit.groundZ;
-                    int targetY = -1;
-                    int topIndex = FindHighestCubeIndex(targetX, targetZ);
-                    if (topIndex >= 0)
-                    {
-                        targetY = g_placedCubes[topIndex].gridY + 1;
-                    }
-                    PlaceCube(targetX, targetY, targetZ, preset);
-                }
-
-                if (CollidesAtPosition(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ}))
-                {
-                    float top = HighestSurfaceAt(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ});
-                    g_game.cubeY = top;
-                    g_game.cubeVelocity = 0.0f;
-                    g_game.grounded = true;
+                    g_pendingCubeDrag = true;
+                    g_pendingDragIndex = cubeIndex;
+                    g_pendingDragStartPos = POINT{mouseX, mouseY};
+                    g_pendingDragStartTime = GetSeconds();
+                    g_pendingDragHit = hit;
+                    g_pendingPlacementPresetIndex = g_selectedPresetIndex;
                 }
             }
-            else if (uMsg == WM_RBUTTONDOWN)
+            else
             {
-                if (hit.hitCube)
+                int targetX = 0;
+                int targetY = 0;
+                int targetZ = 0;
+                if (ComputePlacementTarget(hit, targetX, targetY, targetZ))
                 {
-                    RemoveCube(hit.cubeX, hit.cubeY, hit.cubeZ);
-                }
-                else if (hit.hitGround)
-                {
-                    int topIndex = FindHighestCubeIndex(hit.groundX, hit.groundZ);
-                    if (topIndex >= 0)
+                    const SpawnPreset preset = GetSelectedPreset();
+                    const int textureHandle = g_presetTextureHandles[std::clamp(g_selectedPresetIndex, 0, static_cast<int>(kSpawnPresetCount) - 1)];
+                    PlaceCube(targetX, targetY, targetZ, preset, textureHandle);
+                    if (CollidesAtPosition(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ}))
                     {
-                        const PlacedCube& cube = g_placedCubes[topIndex];
-                        RemoveCube(cube.gridX, cube.gridY, cube.gridZ);
+                        float top = HighestSurfaceAt(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ});
+                        g_game.cubeY = top;
+                        g_game.cubeVelocity = 0.0f;
+                        g_game.grounded = true;
                     }
+                }
+            }
+            return 0;
+        }
+        case WM_LBUTTONUP:
+        {
+            if (g_draggingCube)
+            {
+                FinishCubeDrag(g_dragPreviewValid && g_dragPreviewHasPosition);
+                return 0;
+            }
+            if (g_pendingCubeDrag)
+            {
+                int targetX = 0;
+                int targetY = 0;
+                int targetZ = 0;
+                if (ComputePlacementTarget(g_pendingDragHit, targetX, targetY, targetZ))
+                {
+                    if (g_pendingPlacementPresetIndex >= 0)
+                    {
+                        const int presetIndex = std::clamp(g_pendingPlacementPresetIndex, 0, static_cast<int>(kSpawnPresetCount) - 1);
+                        const SpawnPreset& preset = kSpawnPresets[presetIndex];
+                        const int textureHandle = g_presetTextureHandles[presetIndex];
+                        PlaceCube(targetX, targetY, targetZ, preset, textureHandle);
+                        if (CollidesAtPosition(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ}))
+                        {
+                            float top = HighestSurfaceAt(Vec3{g_game.cubeX, g_game.cubeY, g_game.cubeZ});
+                            g_game.cubeY = top;
+                            g_game.cubeVelocity = 0.0f;
+                            g_game.grounded = true;
+                        }
+                    }
+                }
+                CancelPendingCubeDrag();
+                return 0;
+            }
+            break;
+        }
+        case WM_MOUSEMOVE:
+        {
+            const int mouseX = GET_X_LPARAM(lParam);
+            const int mouseY = GET_Y_LPARAM(lParam);
+            if (g_draggingCube)
+            {
+                if (wParam & MK_LBUTTON)
+                {
+                    UpdateDraggingCubePreview(mouseX, mouseY);
+                }
+                else
+                {
+                    FinishCubeDrag(false);
+                }
+                return 0;
+            }
+
+            if (g_pendingCubeDrag)
+            {
+                if (wParam & MK_LBUTTON)
+                {
+                    double elapsed = GetSeconds() - g_pendingDragStartTime;
+                    const int deltaX = std::abs(mouseX - g_pendingDragStartPos.x);
+                    const int deltaY = std::abs(mouseY - g_pendingDragStartPos.y);
+                    if (elapsed >= kDragStartHoldSeconds ||
+                        deltaX >= kDragStartPixelThreshold ||
+                        deltaY >= kDragStartPixelThreshold)
+                    {
+                        BeginCubeDrag(g_pendingDragIndex, mouseX, mouseY);
+                        g_pendingCubeDrag = false;
+                        if (g_draggingCube)
+                        {
+                            SetCapture(hwnd);
+                        }
+                    }
+                }
+                else
+                {
+                    CancelPendingCubeDrag();
+                }
+            }
+            break;
+        }
+        case WM_RBUTTONDOWN:
+        {
+            if (g_draggingCube)
+            {
+                FinishCubeDrag(false);
+            }
+            CancelPendingCubeDrag();
+
+            if (ImGui::GetIO().WantCaptureMouse)
+            {
+                break;
+            }
+
+            const int mouseX = GET_X_LPARAM(lParam);
+            const int mouseY = GET_Y_LPARAM(lParam);
+            Vec3 origin;
+            Vec3 direction;
+            if (!ComputeRayFromScreen(mouseX, mouseY, origin, direction))
+            {
+                break;
+            }
+
+            RayHit hit = CastWorldRay(origin, direction);
+            if (!hit.hit)
+            {
+                break;
+            }
+
+            if (hit.hitCube)
+            {
+                RemoveCube(hit.cubeX, hit.cubeY, hit.cubeZ);
+            }
+            else if (hit.hitGround)
+            {
+                int topIndex = FindHighestCubeIndex(hit.groundX, hit.groundZ);
+                if (topIndex >= 0)
+                {
+                    const PlacedCube& cube = g_placedCubes[topIndex];
+                    RemoveCube(cube.gridX, cube.gridY, cube.gridZ);
                 }
             }
             return 0;
@@ -1883,6 +2536,44 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGui::SameLine();
                     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "glow");
                 }
+                if (preset.transparent)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "glass");
+                }
+                ImGui::Indent();
+                ImGui::InputTextWithHint("##TexturePath", "texture.png", &g_presetTexturePaths[i]);
+                ImGui::SameLine();
+                if (ImGui::Button("Load PNG"))
+                {
+                    std::string status;
+                    const int handle = LoadTextureFromFile(g_presetTexturePaths[i], status);
+                    if (handle >= 0)
+                    {
+                        g_presetTextureHandles[i] = handle;
+                    }
+                    g_presetTextureStatus[i] = status;
+                }
+                ImGui::SameLine();
+                if (g_presetTextureHandles[i] >= 0 && ImGui::Button("Clear"))
+                {
+                    g_presetTextureHandles[i] = kInvalidTextureHandle;
+                    g_presetTextureStatus[i].clear();
+                }
+                if (!g_presetTextureStatus[i].empty())
+                {
+                    const bool ok = g_presetTextureHandles[i] >= 0 && g_presetTextureStatus[i] == "Loaded";
+                    const ImVec4 statusColor = ok ? ImVec4(0.4f, 0.85f, 0.5f, 1.0f) : ImVec4(0.95f, 0.45f, 0.45f, 1.0f);
+                    ImGui::TextColored(statusColor, "%s", g_presetTextureStatus[i].c_str());
+                }
+                if (g_presetTextureHandles[i] >= 0)
+                {
+                    if (const LoadedTexture* tex = GetTextureInfo(g_presetTextureHandles[i]))
+                    {
+                        ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "%d x %d", tex->width, tex->height);
+                    }
+                }
+                ImGui::Unindent();
                 ImGui::PopID();
             }
 
@@ -1940,6 +2631,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         const float maxDelta = kCameraRotationSpeed * deltaTime;
         const float clampedDelta = std::clamp(yawDifference, -maxDelta, maxDelta);
         g_cameraYawDegrees += clampedDelta;
+        const float pitchDifference = std::clamp(g_cameraPitchTarget, kCameraPitchMinDegrees, kCameraPitchMaxDegrees) - g_cameraPitchDegrees;
+        const float maxPitchDelta = kCameraPitchSpeed * deltaTime;
+        const float clampedPitch = std::clamp(pitchDifference, -maxPitchDelta, maxPitchDelta);
+        g_cameraPitchDegrees = std::clamp(g_cameraPitchDegrees + clampedPitch, kCameraPitchMinDegrees, kCameraPitchMaxDegrees);
         RenderScene(g_cubeMesh);
 
         UpdateSnow(deltaTime, renderWidth, renderHeight);
@@ -1953,6 +2648,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     {
         SaveNotesToFile();
     }
+
+    CleanupLoadedTextures();
+    ShutdownGdiplus();
 
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplWin32_Shutdown();
