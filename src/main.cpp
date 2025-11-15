@@ -355,7 +355,6 @@ namespace
     constexpr float kCameraRotationSpeed = 240.0f;
     std::vector<PlacedCube> g_placedCubes;
     bool g_showContentPanel = false;
-    bool g_showEnvironmentPanel = false;
     float g_contentPanelPosY = 0.0f;
     constexpr float kContentPanelHeight = 180.0f;
     constexpr float kContentPanelSlideSpeed = 12.0f;
@@ -2558,11 +2557,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         {
             g_showContentPanel = !g_showContentPanel;
         }
-        ImGui::SameLine();
-        if (ImGui::Button(g_showEnvironmentPanel ? "Env On" : "Env"))
-        {
-            g_showEnvironmentPanel = !g_showEnvironmentPanel;
-        }
         if (g_notesDirty)
         {
             ImGui::SameLine();
@@ -2804,38 +2798,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::PopID();
-            }
-
-            ImGui::End();
-        }
-
-        if (g_showEnvironmentPanel)
-        {
-            ImGui::SetNextWindowPos(ImVec2(static_cast<float>(g_windowWidth) - 260.0f, 60.0f), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(240.0f, 160.0f), ImGuiCond_Always);
-            ImGuiWindowFlags envFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
-            ImGui::Begin("EnvironmentPanel", nullptr, envFlags);
-            ImGui::PopStyleVar();
-
-            ImGui::TextUnformatted("Background Gradient");
-            ImGui::Separator();
-            bool topChanged = ImGui::ColorEdit3("Top", &g_gradientTop.r, ImGuiColorEditFlags_NoInputs);
-            bool bottomChanged = ImGui::ColorEdit3("Bottom", &g_gradientBottom.r, ImGuiColorEditFlags_NoInputs);
-            if (topChanged || bottomChanged)
-            {
-                g_gradientTop.r = std::clamp(g_gradientTop.r, 0.0f, 1.0f);
-                g_gradientTop.g = std::clamp(g_gradientTop.g, 0.0f, 1.0f);
-                g_gradientTop.b = std::clamp(g_gradientTop.b, 0.0f, 1.0f);
-                g_gradientBottom.r = std::clamp(g_gradientBottom.r, 0.0f, 1.0f);
-                g_gradientBottom.g = std::clamp(g_gradientBottom.g, 0.0f, 1.0f);
-                g_gradientBottom.b = std::clamp(g_gradientBottom.b, 0.0f, 1.0f);
-            }
-            ImGui::Spacing();
-            if (ImGui::Button("Reset##Env"))
-            {
-                g_gradientTop = {0.18f, 0.13f, 0.25f};
-                g_gradientBottom = {0.03f, 0.05f, 0.12f};
             }
 
             ImGui::End();
